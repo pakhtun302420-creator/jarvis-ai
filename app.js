@@ -1,93 +1,93 @@
 /* =========================================================================
-   JARVIS AI — Created by IZHAR AFRIDI
-   Voice-first assistant: recognition, synthesis, multi-API fallback,
-   offline mode, language auto-detection, English coaching suite.
+   JARVIS — Created by IZHAR AFRIDI
+   Voice-only assistant engine.
+   - Reliable mobile SpeechSynthesis unlock (sync inside the tap gesture)
+   - Chunked TTS (Chrome kills long utterances) + keep-alive + retry
+   - Echo-safe continuous recognition (paused while JARVIS speaks)
+   - Auto-restart with backoff on end/error
+   - 5-provider API rotation with 429 / network failover
+   - Urdu / Roman Urdu / English / Minglish detection
+   - English coaching system prompt + offline rule-based backup
    ========================================================================= */
 
 (function () {
   "use strict";
 
   /* ----------------------------- STATE ------------------------------- */
-  const State = {
-    DORMANT: "dormant",
-    LISTENING: "listening",
-    THINKING: "thinking",
-    SPEAKING: "speaking",
-  };
+  const State = { DORMANT: "dormant", LISTENING: "listening", THINKING: "thinking", SPEAKING: "speaking" };
 
   const App = {
     audioUnlocked: false,
-    micOn: false,
-    currentState: State.DORMANT,
+    voiceMode: false,          // user has activated voice mode (mic should stay on)
+    awake: false,              // wake word heard at least once this session
+    state: State.DORMANT,
     recognition: null,
-    recognitionActive: false,
-    conversation: [], // {role:'user'|'assistant', content, lang}
-    lastLang: "en", // 'en' or 'ur'
+    recognitionRunning: false,
+    recognitionBlocked: false, // true while JARVIS speaks or thinks (prevents echo)
+    restartTimer: null,
+    restartDelay: 300,
+    conversation: [],
+    lastLang: "en",
     awaitingSalamReply: false,
     awaitingWellbeingReply: false,
-    activeRolePlay: null, // {scenario, turn}
-    activeCoaching: null, // {topic}
-    apiKeys: {
-      gemini: "",
-      groq: "",
-      openrouter: "",
-      together: "",
-      cohere: "",
-    },
+    processing: false,
+    apiKeys: { gemini: "", groq: "", openrouter: "", together: "", cohere: "" },
     providerOrder: ["gemini", "groq", "openrouter", "together", "cohere"],
     voicePref: "auto",
+    rate: 1.0,
+    pitch: 1.0,
     isOnline: navigator.onLine,
   };
 
   /* --------------------------- DOM REFS ------------------------------ */
+  const $ = (id) => document.getElementById(id);
   const el = {
-    orb: document.getElementById("orb"),
-    orbWrap: document.getElementById("orbWrap"),
-    orbLabel: document.getElementById("orbLabel"),
-    unlockHint: document.getElementById("unlockHint"),
-    transcript: document.getElementById("transcript"),
-    micBtn: document.getElementById("micBtn"),
-    textInput: document.getElementById("textInput"),
-    sendBtn: document.getElementById("sendBtn"),
-    netStatus: document.getElementById("netStatus"),
-    netStatusText: document.getElementById("netStatusText"),
-    settingsBtn: document.getElementById("settingsBtn"),
-    settingsModal: document.getElementById("settingsModal"),
-    saveKeysBtn: document.getElementById("saveKeysBtn"),
-    clearKeysBtn: document.getElementById("clearKeysBtn"),
-    quickRow: document.getElementById("quickRow"),
-    key_gemini: document.getElementById("key_gemini"),
-    key_groq: document.getElementById("key_groq"),
-    key_openrouter: document.getElementById("key_openrouter"),
-    key_together: document.getElementById("key_together"),
-    key_cohere: document.getElementById("key_cohere"),
-    voicePref: document.getElementById("voicePref"),
+    orb: $("orb"),
+    orbWrap: $("orbWrap"),
+    statusLine: $("statusLine"),
+    glass: $("glass"),
+    gEmpty: $("gEmpty"),
+    netStatus: $("netStatus"),
+    netStatusText: $("netStatusText"),
+    settingsBtn: $("settingsBtn"),
+    settingsModal: $("settingsModal"),
+    saveKeysBtn: $("saveKeysBtn"),
+    clearKeysBtn: $("clearKeysBtn"),
+    key_gemini: $("key_gemini"),
+    key_groq: $("key_groq"),
+    key_openrouter: $("key_openrouter"),
+    key_together: $("key_together"),
+    key_cohere: $("key_cohere"),
+    voicePref: $("voicePref"),
+    rateRange: $("rateRange"),
+    pitchRange: $("pitchRange"),
+    rateBadge: $("rateBadge"),
+    pitchBadge: $("pitchBadge"),
   };
 
   /* ============================================================
-     PERSISTENCE (LocalStorage)
+     PERSISTENCE
      ============================================================ */
-  const Storage = {
+  const Store = {
     load() {
       try {
         const raw = localStorage.getItem("jarvis_api_keys");
         if (raw) App.apiKeys = Object.assign(App.apiKeys, JSON.parse(raw));
-        const pref = localStorage.getItem("jarvis_voice_pref");
-        if (pref) App.voicePref = pref;
-      } catch (e) {
-        console.warn("Storage load failed", e);
-      }
+        App.voicePref = localStorage.getItem("jarvis_voice_pref") || "auto";
+        App.rate = parseFloat(localStorage.getItem("jarvis_rate")) || 1.0;
+        App.pitch = parseFloat(localStorage.getItem("jarvis_pitch")) || 1.0;
+      } catch (e) { console.warn("Store.load failed", e); }
     },
     save() {
       try {
         localStorage.setItem("jarvis_api_keys", JSON.stringify(App.apiKeys));
         localStorage.setItem("jarvis_voice_pref", App.voicePref);
-      } catch (e) {
-        console.warn("Storage save failed", e);
-      }
+        localStorage.setItem("jarvis_rate", String(App.rate));
+        localStorage.setItem("jarvis_pitch", String(App.pitch));
+      } catch (e) { console.warn("Store.save failed", e); }
     },
-    clear() {
-      localStorage.removeItem("jarvis_api_keys");
+    clearKeys() {
+      try { localStorage.removeItem("jarvis_api_keys"); } catch (e) { /* ignore */ }
       App.apiKeys = { gemini: "", groq: "", openrouter: "", together: "", cohere: "" };
     },
   };
@@ -95,700 +95,908 @@
   /* ============================================================
      UI HELPERS
      ============================================================ */
-  function setOrbState(state) {
-    App.currentState = state;
-    el.orb.className = "orb " + state;
-    const labels = {
-      [State.DORMANT]: "TAP TO ACTIVATE",
-      [State.LISTENING]: "LISTENING...",
-      [State.THINKING]: "PROCESSING...",
-      [State.SPEAKING]: "SPEAKING...",
-    };
-    el.orbLabel.textContent = labels[state] || "";
+  let statusLockUntil = 0; // while now < this, passive state changes don't overwrite the status text
+
+  function setStatus(text) {
+    el.statusLine.textContent = text;
+    el.statusLine.classList.remove("flash");
+    void el.statusLine.offsetWidth; // restart animation
+    el.statusLine.classList.add("flash");
   }
 
-  function addMessage(role, text, meta) {
-    const div = document.createElement("div");
-    div.className = "msg " + (role === "user" ? "user" : role === "sys" ? "sys" : "jarvis");
-    const textNode = document.createElement("span");
-    textNode.textContent = text;
-    div.appendChild(textNode);
-    if (meta) {
-      const m = document.createElement("span");
-      m.className = "meta";
-      m.textContent = meta;
-      div.appendChild(m);
+  /* lockMs > 0 pins the message so quick state changes (e.g. recognition onstart) can't clobber it */
+  function setOrb(state, statusOverride, lockMs) {
+    App.state = state;
+    el.orb.className = "orb " + state;
+    el.orbWrap.classList.toggle("active", state !== State.DORMANT);
+    const defaults = {
+      [State.DORMANT]: "Tap orb to start voice mode",
+      [State.LISTENING]: "Listening...",
+      [State.THINKING]: "Processing...",
+      [State.SPEAKING]: "JARVIS Speaking...",
+    };
+    const now = Date.now();
+    if (statusOverride) {
+      statusLockUntil = lockMs ? now + lockMs : 0;
+      setStatus(statusOverride);
+    } else if (now >= statusLockUntil || state === State.SPEAKING || state === State.THINKING) {
+      // speaking/thinking are important enough to always break through a lock
+      statusLockUntil = 0;
+      setStatus(defaults[state]);
     }
-    el.transcript.appendChild(div);
-    el.transcript.scrollTop = el.transcript.scrollHeight + 200;
-    return div;
+    // else: a lock is active -> keep the pinned message, only the orb animation changes
   }
+
+  /* Glass overlay: one "you" row (live/interim) + one "jarvis" row + optional sys row */
+  const Glass = {
+    youRow: null, jarvisRow: null, sysRow: null,
+    _ensureNotEmpty() { if (el.gEmpty && el.gEmpty.parentNode) el.gEmpty.remove(); },
+    _row(cls, tag) {
+      this._ensureNotEmpty();
+      const row = document.createElement("div");
+      row.className = "g-row " + cls;
+      const t = document.createElement("span"); t.className = "g-tag"; t.textContent = tag;
+      const x = document.createElement("div"); x.className = "g-text";
+      row.appendChild(t); row.appendChild(x);
+      el.glass.appendChild(row);
+      return row;
+    },
+    showYou(text, interim) {
+      if (!this.youRow) this.youRow = this._row("you", "You");
+      this.youRow.classList.toggle("interim", !!interim);
+      this.youRow.querySelector(".g-text").textContent = text;
+      el.glass.scrollTop = el.glass.scrollHeight;
+    },
+    showJarvis(text) {
+      if (!this.jarvisRow) this.jarvisRow = this._row("jarvis", "JARVIS");
+      this.jarvisRow.querySelector(".g-text").textContent = text;
+      el.glass.scrollTop = el.glass.scrollHeight;
+    },
+    showSys(text) {
+      if (!this.sysRow) this.sysRow = this._row("sys", "System");
+      this.sysRow.querySelector(".g-text").textContent = text;
+      el.glass.scrollTop = el.glass.scrollHeight;
+    },
+    newTurn() {
+      // clear the previous exchange so the overlay stays clean and minimal
+      el.glass.innerHTML = "";
+      this.youRow = null; this.jarvisRow = null; this.sysRow = null;
+    },
+  };
 
   function setNetStatus() {
     App.isOnline = navigator.onLine;
-    if (App.isOnline) {
-      el.netStatus.classList.add("online");
-      el.netStatusText.textContent = "ONLINE";
-    } else {
-      el.netStatus.classList.remove("online");
-      el.netStatusText.textContent = "OFFLINE";
-    }
+    el.netStatus.classList.toggle("online", App.isOnline);
+    el.netStatusText.textContent = App.isOnline ? "ONLINE" : "OFFLINE";
   }
-  window.addEventListener("online", () => {
-    setNetStatus();
-    addMessage("sys", "🌐 Connection restored — full AI engines available.");
-  });
-  window.addEventListener("offline", () => {
-    setNetStatus();
-    addMessage("sys", "⚠ Connection lost — switching to Offline Backup Mode.");
-  });
+  window.addEventListener("online", () => { setNetStatus(); Glass.showSys("Connection restored — AI engines available."); });
+  window.addEventListener("offline", () => { setNetStatus(); Glass.showSys("Offline — using local backup mode."); });
 
   /* ============================================================
-     LANGUAGE DETECTION (Urdu / Roman Urdu / English / Minglish)
+     LANGUAGE DETECTION  (Urdu / Roman Urdu / English / Minglish)
      ============================================================ */
   const URDU_SCRIPT_RE = /[\u0600-\u06FF]/;
-  // Common Roman-Urdu tokens (kept concise but effective)
   const ROMAN_URDU_WORDS = new Set([
-    "hai","hain","ho","hoon","hun","kya","kyun","kyu","kaisay","kaise","kaha","kahan",
-    "acha","accha","theek","thik","nahi","nahin","han","haan","mujhe","mujhy","tum",
-    "tumhara","aap","ap","apka","aapka","mera","meri","mere","kar","karo","karna",
-    "raha","rahi","rahe","bhai","yaar","shukriya","mehrbani","salam","assalam",
-    "walaikum","kyaa","bata","batao","bolo","suno","chal","chalo","abhi","phir",
-    "wapis","wapas","zindagi","dost","pyar","dil","waqt","paisay","paise","ghar",
-    "kaam","matlab","bilkul","zaroor","shayad","lekin","magar","aur","ke","ki","ka",
-    "se","ko","me","mein","par","tha","thi","thay","gaya","gayi","gaye","raha hai",
+    "hai","hain","ho","hoon","hun","kya","kyun","kyu","kaisay","kaise","kaisa","kaisi","kaha","kahan",
+    "acha","accha","achi","theek","thik","nahi","nahin","han","haan","mujhe","mujhy","mjhe","tum",
+    "tumhara","tumhari","aap","ap","apka","aapka","aapki","mera","meri","mere","kar","karo","karna",
+    "karein","kariye","raha","rahi","rahe","bhai","yaar","shukriya","mehrbani","salam","assalam",
+    "walaikum","bata","batao","bataen","bolo","suno","chal","chalo","abhi","phir","wapis","wapas",
+    "zindagi","dost","pyar","dil","waqt","paisay","paise","ghar","kaam","matlab","bilkul","zaroor",
+    "shayad","lekin","magar","aur","ke","ki","ka","se","ko","mein","par","tha","thi","thay","gaya",
+    "gayi","gaye","sikhao","sikhna","seekhna","samjhao","samjha","samajh","kuch","koi","sab","bohat",
+    "bahut","zyada","kam","wala","wali","liye","liya","hoga","hogi","chahiye","chahte","chahta",
+    "chahti","mujh","hum","humein","unko","usko","isko","yeh","yah","woh","wo","kaun","kab","kitna",
+    "kitni","kitne","subah","raat","shaam","khana","paani","madad","dobara","ek","do","teen",
   ]);
 
   function detectLanguage(text) {
     if (!text) return "en";
     if (URDU_SCRIPT_RE.test(text)) return "ur";
-    const words = text.toLowerCase().replace(/[^\w\s']/g, " ").split(/\s+/).filter(Boolean);
-    if (words.length === 0) return "en";
-    let romanHits = 0;
-    words.forEach((w) => {
-      if (ROMAN_URDU_WORDS.has(w)) romanHits++;
-    });
-    const ratio = romanHits / words.length;
-    // Minglish: if a meaningful chunk of words are roman-urdu tokens, treat as Urdu-leaning
-    if (ratio >= 0.28) return "ur";
-    return "en";
+    const words = text.toLowerCase().replace(/[^a-z\s']/g, " ").split(/\s+/).filter(Boolean);
+    if (!words.length) return "en";
+    let hits = 0;
+    for (const w of words) if (ROMAN_URDU_WORDS.has(w)) hits++;
+    // Minglish (mixed) counts as Urdu-leaning when a meaningful share of tokens are Roman-Urdu
+    return hits / words.length >= 0.25 || hits >= 3 ? "ur" : "en";
   }
 
   /* ============================================================
-     WAKE WORD + INTENT DETECTION
+     WAKE WORD / SALAM / INTENTS
      ============================================================ */
-  const WAKE_WORD_RE = /\b(hello jarvis|hey jarvis|hi jarvis|jarvis)\b/i;
+  // Recognition often mishears "Jarvis" — accept common variants
+  const WAKE_RE = /\b(hello|hey|hi|ok|okay)?\s*(jarvis|jarvish|jervis|service|javis|jarwis|jarves|jarvi)\b/i;
+  const WAKE_STRICT_RE = /\b(jarvis|jarvish|jervis|javis|jarwis|jarves)\b/i;
 
-  function isWakeWord(text) {
-    return WAKE_WORD_RE.test(text.trim());
+  function hasWake(text) { return WAKE_STRICT_RE.test(text) || /\b(hello|hey|hi)\s+service\b/i.test(text); }
+  function stripWake(text) {
+    return text.replace(/\b(hello|hey|hi|ok|okay)?\s*(jarvis|jarvish|jervis|javis|jarwis|jarves)\b[,.!?]*/ig, "").trim();
   }
-
   function isSalamReply(text) {
-    const t = text.toLowerCase();
-    return /(walaikum|wa alaikum|valaikum|walekum)/i.test(t) ||
-           /\b(salam|assalam)\b/i.test(t);
+    return /(walaikum|wa\s?alaikum|walekum|valaikum|alaikum|w\.?\s?salam|salam|assalam|assalamu)/i.test(text);
   }
-
-  const INTENT_PATTERNS = [
-    { re: /\bopen youtube\b/i, action: () => openSite("https://www.youtube.com"), en: "Opening YouTube for you, sir.", ur: "Theek hai, YouTube khol raha hoon." },
-    { re: /\bopen google\b/i, action: () => openSite("https://www.google.com"), en: "Opening Google now.", ur: "Google khol raha hoon." },
-    { re: /\bopen gmail\b/i, action: () => openSite("https://mail.google.com"), en: "Opening Gmail.", ur: "Gmail khol raha hoon." },
-    { re: /\bopen maps\b/i, action: () => openSite("https://maps.google.com"), en: "Opening Maps.", ur: "Maps khol raha hoon." },
-    { re: /\bopen whatsapp\b/i, action: () => openSite("https://web.whatsapp.com"), en: "Opening WhatsApp Web.", ur: "WhatsApp khol raha hoon." },
-    { re: /\bopen facebook\b/i, action: () => openSite("https://www.facebook.com"), en: "Opening Facebook.", ur: "Facebook khol raha hoon." },
-    { re: /\bwhat time is it\b|\bcurrent time\b/i, action: null, dynamic: "time" },
-    { re: /\bwhat.?s the date\b|\btoday.?s date\b/i, action: null, dynamic: "date" },
-  ];
 
   function openSite(url) {
-    window.open(url, "_blank");
+    try { window.open(url, "_blank"); } catch (e) { window.location.href = url; }
   }
 
-  function matchIntent(text) {
-    for (const intent of INTENT_PATTERNS) {
-      if (intent.re.test(text)) return intent;
-    }
-    return null;
-  }
+  const INTENTS = [
+    { re: /\bopen\s+(you\s?tube|youtube)\b|\byoutube (kholo|khol do|open)\b/i, url: "https://www.youtube.com", en: "Opening YouTube.", ur: "YouTube khol raha hoon." },
+    { re: /\bopen\s+google\b|\bgoogle (kholo|khol do|open)\b/i, url: "https://www.google.com", en: "Opening Google.", ur: "Google khol raha hoon." },
+    { re: /\bopen\s+gmail\b|\bgmail (kholo|khol do)\b/i, url: "https://mail.google.com", en: "Opening Gmail.", ur: "Gmail khol raha hoon." },
+    { re: /\bopen\s+maps?\b|\bmaps? (kholo|khol do)\b/i, url: "https://maps.google.com", en: "Opening Google Maps.", ur: "Maps khol raha hoon." },
+    { re: /\bopen\s+whats\s?app\b|\bwhats\s?app (kholo|khol do)\b/i, url: "https://web.whatsapp.com", en: "Opening WhatsApp.", ur: "WhatsApp khol raha hoon." },
+    { re: /\bopen\s+facebook\b|\bfacebook (kholo|khol do)\b/i, url: "https://www.facebook.com", en: "Opening Facebook.", ur: "Facebook khol raha hoon." },
+    { re: /\bwhat(?:'s| is)? the time\b|\bcurrent time\b|\bwaqt kya\b|\btime kya\b/i, dynamic: "time" },
+    { re: /\bwhat(?:'s| is)? (the |today'?s )?date\b|\btareekh\b|\baaj (ki )?date\b/i, dynamic: "date" },
+  ];
+  function matchIntent(text) { return INTENTS.find((i) => i.re.test(text)) || null; }
 
   /* ============================================================
-     SPEECH SYNTHESIS (TTS)
+     SPEECH SYNTHESIS  (mobile-hardened)
+     ------------------------------------------------------------
+     Problems solved:
+      1. Mobile Chrome/WebView requires speak() to be called
+         synchronously inside a user gesture -> unlock() does this.
+      2. getVoices() is async -> we poll + listen to onvoiceschanged.
+      3. Chrome cuts utterances > ~15s -> text is split in sentences.
+      4. Android sometimes silently drops speak() -> watchdog + retry.
+      5. Recognition hears JARVIS -> mic is blocked while speaking.
      ============================================================ */
   const TTS = {
     voices: [],
+    supported: "speechSynthesis" in window && "SpeechSynthesisUtterance" in window,
+    queueToken: 0,
+
     loadVoices() {
-      this.voices = window.speechSynthesis ? window.speechSynthesis.getVoices() : [];
+      if (!this.supported) return;
+      const v = window.speechSynthesis.getVoices();
+      if (v && v.length) this.voices = v;
     },
+
     pickVoice(lang) {
       if (!this.voices.length) this.loadVoices();
-      const wantUrdu = lang === "ur";
-      let v = null;
-      if (wantUrdu) {
-        v = this.voices.find((x) => /ur|hi|IN/i.test(x.lang));
+      const V = this.voices;
+      if (!V.length) return null;
+      const byLang = (re) => V.find((v) => re.test((v.lang || "").replace("_", "-")));
+      if (lang === "ur") {
+        // Urdu voice -> Hindi voice (understands Roman Urdu phonetics best) -> en-IN -> en-GB
+        return byLang(/^ur/i) || byLang(/^hi/i) || byLang(/^en-IN/i) || byLang(/^en-GB/i) || byLang(/^en/i) || V[0];
       }
-      if (!v) {
-        v = this.voices.find((x) => /en-GB|en_GB/i.test(x.lang)) ||
-            this.voices.find((x) => /en-US|en_US/i.test(x.lang)) ||
-            this.voices.find((x) => /^en/i.test(x.lang));
-      }
-      return v || null;
+      return byLang(/^en-GB/i) || byLang(/^en-US/i) || byLang(/^en-IN/i) || byLang(/^en/i) || V[0];
     },
-    speak(text, lang, onDone) {
-      if (!window.speechSynthesis || !App.audioUnlocked) {
-        if (onDone) onDone();
-        return;
-      }
-      window.speechSynthesis.cancel();
-      const utter = new SpeechSynthesisUtterance(text);
-      const voice = this.pickVoice(lang);
-      if (voice) utter.voice = voice;
-      utter.lang = lang === "ur" ? (voice ? voice.lang : "ur-PK") : "en-US";
-      utter.rate = 1.0;
-      utter.pitch = 1.0;
-      utter.volume = 1.0;
 
-      utter.onstart = () => setOrbState(State.SPEAKING);
-      utter.onend = () => {
-        setOrbState(App.micOn ? State.LISTENING : State.DORMANT);
-        if (onDone) onDone();
+    /* Sentence chunking keeps every utterance short & reliable */
+    chunk(text) {
+      const clean = text.replace(/[*_#`>~|]/g, " ").replace(/\s+/g, " ").trim();
+      if (!clean) return [];
+      const parts = clean.match(/[^.!?۔؟\n]+[.!?۔؟]*/g) || [clean];
+      const out = [];
+      let buf = "";
+      for (const p of parts) {
+        if ((buf + p).length > 160 && buf) { out.push(buf.trim()); buf = p; }
+        else buf += p;
+      }
+      if (buf.trim()) out.push(buf.trim());
+      // hard-split any monster chunk
+      const final = [];
+      for (const c of out) {
+        if (c.length <= 200) final.push(c);
+        else for (let i = 0; i < c.length; i += 180) final.push(c.slice(i, i + 180));
+      }
+      return final;
+    },
+
+    /* MUST be invoked synchronously from the tap handler */
+    unlock() {
+      if (!this.supported) return false;
+      try {
+        window.speechSynthesis.cancel();
+        this.loadVoices();
+        // Audible-but-tiny utterance: silent (volume 0) ones are ignored by some WebViews
+        const u = new SpeechSynthesisUtterance(".");
+        u.volume = 0.01;
+        u.rate = 2;
+        const v = this.pickVoice("en");
+        if (v) u.voice = v;
+        window.speechSynthesis.speak(u);
+        if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+        return true;
+      } catch (e) {
+        console.warn("TTS unlock failed", e);
+        return false;
+      }
+    },
+
+    stop() {
+      this.queueToken++;
+      try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
+    },
+
+    speak(text, lang, onStart, onEnd) {
+      if (!this.supported || !App.audioUnlocked) { if (onEnd) onEnd(false); return; }
+      const chunks = this.chunk(text);
+      if (!chunks.length) { if (onEnd) onEnd(true); return; }
+
+      const token = ++this.queueToken;
+      const synth = window.speechSynthesis;
+      try { synth.cancel(); } catch (e) { /* ignore */ }
+      this.loadVoices();
+      const voice = this.pickVoice(lang);
+      let idx = 0;
+      let started = false;
+      let keepAlive = null;
+
+      const finish = (ok) => {
+        if (keepAlive) { clearInterval(keepAlive); keepAlive = null; }
+        if (token !== this.queueToken) return; // superseded by a newer speak()
+        if (onEnd) onEnd(ok);
       };
-      utter.onerror = () => {
-        setOrbState(App.micOn ? State.LISTENING : State.DORMANT);
-        if (onDone) onDone();
+
+      // Chrome Android bug: long speech pauses itself -> nudge it
+      keepAlive = setInterval(() => {
+        if (token !== this.queueToken) { clearInterval(keepAlive); return; }
+        if (synth.speaking && synth.paused) synth.resume();
+      }, 4000);
+
+      const next = (retry) => {
+        if (token !== this.queueToken) { if (keepAlive) clearInterval(keepAlive); return; }
+        if (idx >= chunks.length) { finish(true); return; }
+
+        const u = new SpeechSynthesisUtterance(chunks[idx]);
+        if (voice) u.voice = voice;
+        u.lang = voice && voice.lang ? voice.lang : (lang === "ur" ? "ur-PK" : "en-US");
+        u.rate = App.rate;
+        u.pitch = App.pitch;
+        u.volume = 1;
+
+        let done = false;
+        let watchdog = null;
+
+        const advance = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(watchdog);
+          idx++;
+          next(false);
+        };
+
+        u.onstart = () => {
+          clearTimeout(watchdog);
+          if (!started) { started = true; if (onStart) onStart(); }
+        };
+        u.onend = advance;
+        u.onerror = (ev) => {
+          if (done) return;
+          const err = ev && ev.error;
+          if (err === "interrupted" || err === "canceled") { done = true; clearTimeout(watchdog); return; }
+          if (!retry) {
+            // one retry with default voice (some Android voices fail to load)
+            done = true; clearTimeout(watchdog);
+            try { synth.cancel(); } catch (e) { /* ignore */ }
+            const u2 = new SpeechSynthesisUtterance(chunks[idx]);
+            u2.rate = App.rate; u2.pitch = App.pitch; u2.volume = 1;
+            u2.onstart = () => { if (!started) { started = true; if (onStart) onStart(); } };
+            u2.onend = () => { idx++; next(false); };
+            u2.onerror = () => { idx++; next(false); };
+            synth.speak(u2);
+          } else advance();
+        };
+
+        // Watchdog: if engine never fires onstart (silent drop), skip the chunk
+        watchdog = setTimeout(() => {
+          if (!started && !done) {
+            try { synth.cancel(); } catch (e) { /* ignore */ }
+            if (!retry) { done = true; next(true); } else advance();
+          }
+        }, 4500);
+
+        try {
+          if (synth.paused) synth.resume();
+          synth.speak(u);
+        } catch (e) { advance(); }
       };
-      window.speechSynthesis.speak(utter);
+
+      next(false);
     },
   };
 
-  if (window.speechSynthesis) {
+  if (TTS.supported) {
+    TTS.loadVoices();
     window.speechSynthesis.onvoiceschanged = () => TTS.loadVoices();
+    // Some Android builds populate voices late without firing the event
+    let tries = 0;
+    const poll = setInterval(() => {
+      TTS.loadVoices();
+      if (TTS.voices.length || ++tries > 20) clearInterval(poll);
+    }, 400);
   }
 
-  function unlockAudio() {
-    if (App.audioUnlocked) return;
-    App.audioUnlocked = true;
-    try {
-      const u = new SpeechSynthesisUtterance(" ");
-      u.volume = 0;
-      window.speechSynthesis.speak(u);
-    } catch (e) { /* ignore */ }
-    el.unlockHint.style.display = "none";
-    addMessage("sys", "🔓 Audio unlocked. JARVIS is ready.");
+  /* Speak a reply: blocks the mic, drives the orb, then resumes listening */
+  function speakReply(text, lang, tag) {
+    const speakLang = App.voicePref === "auto" ? lang : App.voicePref;
+    Glass.showJarvis(text);
+    App.conversation.push({ role: "assistant", content: text, lang });
+    if (App.conversation.length > 40) App.conversation = App.conversation.slice(-40);
+
+    Recognition.block();
+    setOrb(State.THINKING, "Processing...");
+
+    let spokeStarted = false;
+    TTS.speak(
+      text,
+      speakLang,
+      () => { spokeStarted = true; setOrb(State.SPEAKING); },
+      (ok) => {
+        App.processing = false;
+        // Small settle delay so the mic doesn't catch the audio tail
+        setTimeout(() => {
+          Recognition.unblock();
+          if (App.voiceMode) setOrb(State.LISTENING);
+          else setOrb(State.DORMANT);
+        }, 450);
+        if (!ok && !spokeStarted) Glass.showSys("Voice output unavailable on this device — showing text only.");
+      }
+    );
   }
 
   /* ============================================================
-     SPEECH RECOGNITION (STT)
+     SPEECH RECOGNITION  (continuous, echo-safe, self-healing)
      ============================================================ */
-  function initRecognition() {
-    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SR) {
-      addMessage("sys", "⚠ Speech recognition is not supported in this browser. You can still type below.");
-      return null;
-    }
-    const rec = new SR();
-    rec.continuous = true;
-    rec.interimResults = false;
-    rec.lang = "en-US"; // recognition works across Urdu/English fairly well on en-US/ur-PK; we keep en-US as base and rely on text detection
-    rec.maxAlternatives = 1;
+  const Recognition = {
+    supported: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
 
-    rec.onstart = () => {
-      App.recognitionActive = true;
-      if (App.micOn) setOrbState(State.LISTENING);
-    };
+    create() {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const rec = new SR();
+      rec.continuous = true;
+      rec.interimResults = true;
+      rec.maxAlternatives = 1;
+      rec.lang = "en-US"; // recognises Pakistani English + Roman Urdu phonetics reasonably well
 
-    rec.onresult = (event) => {
-      const last = event.results[event.results.length - 1];
-      if (!last.isFinal) return;
-      const transcript = last[0].transcript.trim();
-      if (!transcript) return;
-      handleUserUtterance(transcript, "voice");
-    };
+      rec.onstart = () => {
+        App.recognitionRunning = true;
+        App.restartDelay = 300;
+        if (App.voiceMode && !App.recognitionBlocked && App.state !== State.SPEAKING && App.state !== State.THINKING) {
+          setOrb(State.LISTENING);
+        }
+      };
 
-    rec.onerror = (event) => {
-      console.warn("Recognition error:", event.error);
-      if (event.error === "not-allowed" || event.error === "service-not-allowed") {
-        addMessage("sys", "⚠ Microphone permission denied. Please allow mic access.");
-        App.micOn = false;
-        updateMicUI();
+      rec.onresult = (event) => {
+        if (App.recognitionBlocked || App.processing) return;
+        let interim = "";
+        let finalText = "";
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          const r = event.results[i];
+          if (r.isFinal) finalText += r[0].transcript;
+          else interim += r[0].transcript;
+        }
+        if (interim && !finalText) Glass.showYou(interim.trim(), true);
+        if (finalText.trim()) handleUtterance(finalText.trim());
+      };
+
+      rec.onerror = (ev) => {
+        const err = ev && ev.error;
+        if (err === "not-allowed" || err === "service-not-allowed") {
+          App.voiceMode = false;
+          setOrb(State.DORMANT, "Microphone blocked — allow mic access");
+          Glass.showSys("Microphone permission denied. Enable it in app settings, then tap the orb again.");
+          return;
+        }
+        if (err === "network") App.restartDelay = Math.min(App.restartDelay * 2, 4000);
+        // "no-speech" / "aborted" / "audio-capture": handled by onend auto-restart
+      };
+
+      rec.onend = () => {
+        App.recognitionRunning = false;
+        Recognition.scheduleRestart();
+      };
+
+      return rec;
+    },
+
+    start() {
+      if (!this.supported || !App.voiceMode || App.recognitionBlocked) return;
+      if (App.recognitionRunning) return;
+      if (!App.recognition) App.recognition = this.create();
+      try {
+        App.recognition.start();
+      } catch (e) {
+        // InvalidStateError -> already started; anything else -> rebuild
+        if (!/already/i.test(String(e && e.message))) {
+          App.recognition = null;
+          this.scheduleRestart();
+        }
       }
-    };
+    },
 
-    rec.onend = () => {
-      App.recognitionActive = false;
-      if (App.micOn) {
-        // auto-restart for continuous hands-free listening
-        try { rec.start(); } catch (e) { /* already started guard */ }
-      } else {
-        setOrbState(State.DORMANT);
+    scheduleRestart() {
+      clearTimeout(App.restartTimer);
+      if (!App.voiceMode) return;
+      App.restartTimer = setTimeout(() => this.start(), App.restartDelay);
+    },
+
+    stop() {
+      clearTimeout(App.restartTimer);
+      if (App.recognition) { try { App.recognition.stop(); } catch (e) { /* ignore */ } }
+    },
+
+    /* Pause the mic while JARVIS is talking so it can't hear itself */
+    block() {
+      App.recognitionBlocked = true;
+      if (App.recognition && App.recognitionRunning) {
+        try { App.recognition.abort(); } catch (e) { /* ignore */ }
       }
-    };
+    },
+    unblock() {
+      App.recognitionBlocked = false;
+      if (App.voiceMode) this.scheduleRestart();
+    },
+  };
 
-    return rec;
-  }
-
-  function updateMicUI() {
-    el.micBtn.classList.toggle("active", App.micOn);
-    if (App.micOn) {
-      setOrbState(State.LISTENING);
-    } else {
-      setOrbState(State.DORMANT);
+  /* Watchdog: if the browser silently kills recognition, revive it */
+  setInterval(() => {
+    if (App.voiceMode && !App.recognitionBlocked && !App.recognitionRunning && !App.processing) {
+      Recognition.start();
     }
-  }
-
-  function toggleMic() {
-    if (!App.audioUnlocked) unlockAudio();
-    if (!App.recognition) {
-      App.recognition = initRecognition();
-      if (!App.recognition) return;
-    }
-    App.micOn = !App.micOn;
-    updateMicUI();
-    if (App.micOn) {
-      try { App.recognition.start(); } catch (e) { /* ignore double start */ }
-    } else {
-      try { App.recognition.stop(); } catch (e) { /* ignore */ }
-    }
-  }
+  }, 3000);
 
   /* ============================================================
-     OFFLINE BACKUP MODE — rule based content
+     OFFLINE BACKUP BANK
      ============================================================ */
-  const OfflineBank = {
-    debateTopics: [
-      "Should social media be banned for children under 16?",
+  const Offline = {
+    debate: [
+      "Should social media be banned for children under sixteen?",
       "Is artificial intelligence a threat to human jobs?",
       "Should university education be free for everyone?",
-      "Is nuclear energy the best solution to climate change?",
-      "Should exams be abolished in favor of continuous assessment?",
+      "Is nuclear energy the best answer to climate change?",
+      "Should exams be replaced by continuous assessment?",
       "Is a four-day work week better for productivity?",
     ],
-    grammarTips: {
-      tenses: "Present Simple: I work. Present Continuous: I am working. Present Perfect: I have worked. Past Simple: I worked. Past Continuous: I was working. Past Perfect: I had worked. Future Simple: I will work.",
-      modals: "Modal verbs (can, could, may, might, must, shall, should, will, would) show ability, permission, possibility, or obligation. Example: 'You must submit the form by Friday' shows obligation.",
-      passive: "Passive voice: object + be + past participle + (by agent). Active: 'The chef cooked the meal.' Passive: 'The meal was cooked by the chef.'",
-      conditionals: "Zero: If you heat water, it boils. First: If it rains, I will stay home. Second: If I had money, I would travel. Third: If I had studied, I would have passed.",
+    grammar: {
+      tense: "Present simple: I work. Present continuous: I am working. Present perfect: I have worked. Past simple: I worked. Past continuous: I was working. Past perfect: I had worked. Future simple: I will work.",
+      modal: "Modal verbs are can, could, may, might, must, shall, should, will and would. They show ability, permission, possibility or obligation. For example: You must submit the form by Friday.",
+      passive: "Passive voice uses object plus be plus past participle. Active: The chef cooked the meal. Passive: The meal was cooked by the chef.",
+      conditional: "Zero conditional: If you heat water, it boils. First: If it rains, I will stay home. Second: If I had money, I would travel. Third: If I had studied, I would have passed.",
     },
-    practicePrompts: [
+    practice: [
       "Describe your morning routine using at least three different tenses.",
-      "Give a two-minute speech on why reading books matters, using at least two modal verbs.",
-      "Rewrite this sentence in passive voice: 'The manager approved the project.'",
-      "Form a second conditional sentence about your dream job.",
+      "Give a one minute talk on why reading matters, using two modal verbs.",
+      "Rewrite in passive voice: The manager approved the project.",
+      "Make a second conditional sentence about your dream job.",
     ],
-    roleplayScenarios: {
-      interview: [
-        "Tell me about yourself.",
-        "What are your greatest strengths and weaknesses?",
-        "Why do you want to work with our company?",
-        "Where do you see yourself in five years?",
-      ],
-      doctor: [
-        "Good morning, what seems to be the problem today?",
-        "How long have you had this symptom?",
-        "Are you currently taking any medication?",
-        "I'll write you a prescription — take this twice daily after meals.",
-      ],
-      shopkeeper: [
-        "Welcome! What are you looking for today?",
-        "This one is on sale — would you like to try it?",
-        "That will be the total, will you pay by cash or card?",
-        "Thank you for shopping with us, come again!",
-      ],
+    roleplay: {
+      interview: "Let's practise a job interview. First question: Tell me about yourself.",
+      doctor: "Let's practise a doctor visit. I am the doctor. Good morning, what seems to be the problem today?",
+      shop: "Let's practise shopping. I am the shopkeeper. Welcome! What are you looking for today?",
+    },
+    pick(a) { return a[Math.floor(Math.random() * a.length)]; },
+
+    respond(text, lang) {
+      const t = text.toLowerCase();
+      const ur = lang === "ur";
+      if (/debate/.test(t)) {
+        const topic = this.pick(this.debate);
+        return ur ? `Offline mode mein debate topic yeh hai: ${topic} Aap for ya against side chunein.`
+                  : `Here is a debate topic: ${topic} Choose for or against, and I will help you build your points.`;
+      }
+      if (/tense/.test(t)) return this.grammar.tense;
+      if (/modal/.test(t)) return this.grammar.modal;
+      if (/passive/.test(t)) return this.grammar.passive;
+      if (/conditional/.test(t)) return this.grammar.conditional;
+      if (/interview/.test(t)) return this.roleplay.interview;
+      if (/doctor/.test(t)) return this.roleplay.doctor;
+      if (/shop/.test(t)) return this.roleplay.shop;
+      if (/practice|practise|exercise|prompt/.test(t)) {
+        const p = this.pick(this.practice);
+        return ur ? `Practice ke liye yeh try karein: ${p}` : `Try this practice task: ${p}`;
+      }
+      return ur
+        ? "Abhi internet ya AI service available nahi, is liye main offline mode mein hoon. Mujh se debate topic, grammar rules jaise tenses, modals, passive voice, conditionals, ya role play practice maang sakte hain."
+        : "I am in offline backup mode right now. Ask me for a debate topic, a grammar rule like tenses, modals, passive voice or conditionals, or a role play practice.";
     },
   };
 
-  function offlineRespond(userText, lang) {
-    const t = userText.toLowerCase();
-    if (/debate/.test(t)) {
-      const topic = OfflineBank.debateTopics[Math.floor(Math.random() * OfflineBank.debateTopics.length)];
-      return lang === "ur"
-        ? `Offline mode mein, yeh raha aik debate topic: "${topic}" — aap "for" ya "against" side choose kar sakte hain, main structure dene mein madad karoon ga.`
-        : `Here's a debate topic for offline practice: "${topic}". Pick a side — for or against — and I'll help you structure your points.`;
-    }
-    if (/tense/.test(t)) return OfflineBank.grammarTips.tenses;
-    if (/modal/.test(t)) return OfflineBank.grammarTips.modals;
-    if (/passive/.test(t)) return OfflineBank.grammarTips.passive;
-    if (/conditional/.test(t)) return OfflineBank.grammarTips.conditionals;
-    if (/practice|prompt/.test(t)) {
-      const p = OfflineBank.practicePrompts[Math.floor(Math.random() * OfflineBank.practicePrompts.length)];
-      return lang === "ur" ? `Practice ke liye yeh try karein: ${p}` : `Try this practice prompt: ${p}`;
-    }
-    if (/interview/.test(t)) return "Offline Interview Practice — Question: " + OfflineBank.roleplayScenarios.interview[0];
-    if (/doctor/.test(t)) return "Offline Role-Play (Doctor) — " + OfflineBank.roleplayScenarios.doctor[0];
-    if (/shop/.test(t)) return "Offline Role-Play (Shopkeeper) — " + OfflineBank.roleplayScenarios.shopkeeper[0];
-
-    return lang === "ur"
-      ? "Is waqt internet available nahi hai, is liye main offline mode mein hoon. Aap mujh se debate topics, grammar rules (tenses, modals, passive, conditionals), ya role-play practice maang sakte hain."
-      : "I'm currently offline, running in local backup mode. You can ask me for debate topics, grammar quick-reference (tenses, modals, passive voice, conditionals), or role-play practice.";
-  }
-
-  /* ============================================================
-     GRAMMAR CORRECTION ENGINE (lightweight local pass, used to
-     enrich prompts sent to the LLM, and as offline fallback)
-     ============================================================ */
-  const CommonErrors = [
-    { re: /\bi is\b/i, fix: "I am", rule: "Use 'am' with the subject 'I', not 'is'." },
-    { re: /\bhe are\b/i, fix: "he is", rule: "Use 'is' with third-person singular subjects (he/she/it)." },
-    { re: /\bshe are\b/i, fix: "she is", rule: "Use 'is' with third-person singular subjects." },
-    { re: /\bdont has\b/i, fix: "doesn't have", rule: "Use 'doesn't have' for third-person singular negative present." },
-    { re: /\bmore better\b/i, fix: "better", rule: "'Better' is already comparative — don't add 'more'." },
-    { re: /\bi has\b/i, fix: "I have", rule: "Use 'have' with the subject 'I'." },
-    { re: /\bcan able to\b/i, fix: "can", rule: "'Can' already expresses ability — don't add 'able to'." },
-    { re: /\bvery much good\b/i, fix: "very good", rule: "Use 'very good', not 'very much good'." },
-    { re: /\bi am agree\b/i, fix: "I agree", rule: "'Agree' is a verb, not an adjective — no 'am' needed." },
-    { re: /\bdiscuss about\b/i, fix: "discuss", rule: "'Discuss' is transitive — drop 'about'." },
+  /* Lightweight local grammar detector: enriches the LLM prompt */
+  const GRAMMAR_PATTERNS = [
+    { re: /\bi is\b/i, fix: "I am", rule: "Use 'am' with the subject 'I'." },
+    { re: /\b(he|she|it) are\b/i, fix: "$1 is", rule: "Use 'is' with he, she and it." },
+    { re: /\b(he|she|it) (don't|dont)\b/i, fix: "$1 doesn't", rule: "Use 'doesn't' with he, she and it." },
+    { re: /\bi has\b/i, fix: "I have", rule: "Use 'have' with 'I'." },
+    { re: /\bmore better\b/i, fix: "better", rule: "'Better' is already comparative." },
+    { re: /\bcan able to\b/i, fix: "can", rule: "'Can' already means able to." },
+    { re: /\bi am agree\b/i, fix: "I agree", rule: "'Agree' is a verb, so no 'am'." },
+    { re: /\bdiscuss about\b/i, fix: "discuss", rule: "'Discuss' takes a direct object, so drop 'about'." },
+    { re: /\bi am having (a )?(car|house|phone|laptop)\b/i, fix: "I have $1$2", rule: "'Have' for possession is a stative verb and is not used in the continuous form." },
+    { re: /\bmy name is (.*) and i am (\d+) years\b/i, fix: null, rule: "Say 'I am X years old'." },
   ];
-
-  function quickGrammarCheck(text) {
-    for (const err of CommonErrors) {
-      if (err.re.test(text)) {
-        return `I noticed a small grammar slip. Rule: ${err.rule} Suggested correction: "${text.replace(err.re, err.fix)}"`;
+  function grammarHint(text) {
+    for (const g of GRAMMAR_PATTERNS) {
+      if (g.re.test(text)) {
+        const fixed = g.fix ? text.replace(g.re, g.fix) : null;
+        return `Possible grammar slip detected. Rule: ${g.rule}${fixed ? ` Suggested: "${fixed}"` : ""}`;
       }
     }
     return null;
   }
 
   /* ============================================================
-     MULTI-API PROVIDER LAYER WITH AUTO-FAILOVER
+     SYSTEM PROMPT  (English coach + language adaptation)
      ============================================================ */
-
-  function buildSystemPrompt(lang) {
-    const base =
-      "You are JARVIS, a voice-first AI assistant created by IZHAR AFRIDI. " +
-      "You are warm, respectful, concise (2-4 sentences unless asked for detail), and address the user politely (like 'sir' occasionally is fine but not required). " +
-      "You are also a complete English coaching system: you correct grammar mistakes politely, explain rules briefly, and give an improved sentence. " +
-      "You can run role-plays (job interview, doctor visit, shopkeeper, classroom debate), generate debate arguments, vocabulary lists, and presentation outlines. " +
-      "You do NOT ask the user's name unless they explicitly ask you to. " +
-      "Language rule: if the user writes in Urdu or Roman Urdu or mixes Urdu-English (Minglish), reply naturally in the same style (Roman Urdu or Urdu script matching their input); if they write in English, reply in fluent English. " +
-      "Keep responses natural for text-to-speech (avoid heavy markdown, asterisks, or bullet symbols).";
-    return base;
+  function buildSystemPrompt() {
+    return (
+      "You are JARVIS, a voice-first AI assistant created by IZHAR AFRIDI. Everything you write is read aloud by text-to-speech, " +
+      "so keep replies natural and conversational, usually 2 to 4 short sentences, with no markdown, no asterisks, no bullet symbols, no emojis, and no long lists. " +
+      "Be warm, respectful and confident. Do NOT ask for the user's name unless they explicitly ask you to. " +
+      "LANGUAGE RULE: if the user speaks Urdu or Roman Urdu, reply naturally in Roman Urdu (Urdu written in English letters). " +
+      "If the user mixes Urdu and English (Minglish), mirror that mix. If the user speaks English, reply in fluent, clear English. " +
+      "You fully understand Pakistani English accents and phrasing. " +
+      "ENGLISH COACH MODE: you are a complete English learning teacher from beginner to advanced. " +
+      "When the user makes a grammar mistake, correct it politely, explain the rule in one short sentence, then give the improved sentence. " +
+      "You can teach tenses, modal verbs, passive voice and conditionals step by step, giving one small exercise at a time and waiting for the answer. " +
+      "You can run interactive role plays such as a job interview, a doctor visit, a shopkeeper conversation, or a classroom debate: play your part, stay in character, ask one question at a time, and give brief feedback. " +
+      "You can generate structured debate arguments (opening, two or three points, rebuttal, conclusion), public speaking tips, vocabulary lists spoken as short phrases, and presentation outlines. " +
+      "If a hidden system note about a grammar slip is included, use it to coach the user gently. " +
+      "If asked about yourself, say you were created by IZHAR AFRIDI."
+    );
   }
 
-  function toLLMHistory() {
-    // last 12 turns for context window efficiency
-    return App.conversation.slice(-12).map((m) => ({
-      role: m.role === "user" ? "user" : "assistant",
-      content: m.content,
-    }));
+  function historyForLLM() {
+    return App.conversation.slice(-12).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content }));
+  }
+
+  /* ============================================================
+     PROVIDERS  (5 engines, sequential auto-failover)
+     ============================================================ */
+  function fail(provider, res, extra) {
+    const e = new Error(`${provider} ${res ? res.status : "network"}`);
+    e.provider = provider;
+    e.status = res ? res.status : 0;
+    e.extra = extra;
+    return e;
   }
 
   const Providers = {
-    async gemini(key, sysPrompt, history, userText) {
+    async gemini(key, sys, history, userText) {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`;
-      const contents = history.map((m) => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }],
-      }));
+      const contents = history.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
       contents.push({ role: "user", parts: [{ text: userText }] });
-      const body = {
-        system_instruction: { parts: [{ text: sysPrompt }] },
-        contents,
-        generationConfig: { temperature: 0.8, maxOutputTokens: 400 },
-      };
       const res = await fetch(url, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: sys }] },
+          contents,
+          generationConfig: { temperature: 0.8, maxOutputTokens: 500 },
+        }),
       });
-      if (res.status === 429) throw { code: 429, provider: "gemini" };
-      if (!res.ok) throw { code: res.status, provider: "gemini" };
+      if (!res.ok) throw fail("gemini", res);
       const data = await res.json();
-      const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join(" ").trim();
-      if (!text) throw { code: 500, provider: "gemini", msg: "empty response" };
+      const text = data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+        data.candidates[0].content.parts ? data.candidates[0].content.parts.map((p) => p.text || "").join(" ").trim() : "";
+      if (!text) throw fail("gemini", { status: 204 });
       return text;
     },
 
-    async groq(key, sysPrompt, history, userText) {
-      const url = "https://api.groq.com/openai/v1/chat/completions";
-      const messages = [{ role: "system", content: sysPrompt }, ...history, { role: "user", content: userText }];
-      const res = await fetch(url, {
+    async groq(key, sys, history, userText) {
+      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body: JSON.stringify({
           model: "llama-3.3-70b-versatile",
-          messages,
-          temperature: 0.8,
-          max_tokens: 400,
+          messages: [{ role: "system", content: sys }, ...history, { role: "user", content: userText }],
+          temperature: 0.8, max_tokens: 500,
         }),
       });
-      if (res.status === 429) throw { code: 429, provider: "groq" };
-      if (!res.ok) throw { code: res.status, provider: "groq" };
+      if (!res.ok) throw fail("groq", res);
       const data = await res.json();
-      const text = data?.choices?.[0]?.message?.content?.trim();
-      if (!text) throw { code: 500, provider: "groq", msg: "empty response" };
+      const text = data && data.choices && data.choices[0] && data.choices[0].message ? (data.choices[0].message.content || "").trim() : "";
+      if (!text) throw fail("groq", { status: 204 });
       return text;
     },
 
-    async openrouter(key, sysPrompt, history, userText) {
-      const url = "https://openrouter.ai/api/v1/chat/completions";
-      const messages = [{ role: "system", content: sysPrompt }, ...history, { role: "user", content: userText }];
-      const res = await fetch(url, {
+    async openrouter(key, sys, history, userText) {
+      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Authorization: `Bearer ${key}`,
-          "HTTP-Referer": "https://jarvis.ai",
-          "X-Title": "JARVIS AI by IZHAR AFRIDI",
+          "HTTP-Referer": location.origin && location.origin !== "null" ? location.origin : "https://jarvis.local",
+          "X-Title": "JARVIS by IZHAR AFRIDI",
         },
         body: JSON.stringify({
           model: "meta-llama/llama-3.3-70b-instruct:free",
-          messages,
-          temperature: 0.8,
-          max_tokens: 400,
+          messages: [{ role: "system", content: sys }, ...history, { role: "user", content: userText }],
+          temperature: 0.8, max_tokens: 500,
         }),
       });
-      if (res.status === 429) throw { code: 429, provider: "openrouter" };
-      if (!res.ok) throw { code: res.status, provider: "openrouter" };
+      if (!res.ok) throw fail("openrouter", res);
       const data = await res.json();
-      const text = data?.choices?.[0]?.message?.content?.trim();
-      if (!text) throw { code: 500, provider: "openrouter", msg: "empty response" };
+      const text = data && data.choices && data.choices[0] && data.choices[0].message ? (data.choices[0].message.content || "").trim() : "";
+      if (!text) throw fail("openrouter", { status: 204 });
       return text;
     },
 
-    async together(key, sysPrompt, history, userText) {
-      const url = "https://api.together.xyz/v1/chat/completions";
-      const messages = [{ role: "system", content: sysPrompt }, ...history, { role: "user", content: userText }];
-      const res = await fetch(url, {
+    async together(key, sys, history, userText) {
+      const res = await fetch("https://api.together.xyz/v1/chat/completions", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body: JSON.stringify({
           model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-          messages,
-          temperature: 0.8,
-          max_tokens: 400,
+          messages: [{ role: "system", content: sys }, ...history, { role: "user", content: userText }],
+          temperature: 0.8, max_tokens: 500,
         }),
       });
-      if (res.status === 429) throw { code: 429, provider: "together" };
-      if (!res.ok) throw { code: res.status, provider: "together" };
+      if (!res.ok) throw fail("together", res);
       const data = await res.json();
-      const text = data?.choices?.[0]?.message?.content?.trim();
-      if (!text) throw { code: 500, provider: "together", msg: "empty response" };
+      const text = data && data.choices && data.choices[0] && data.choices[0].message ? (data.choices[0].message.content || "").trim() : "";
+      if (!text) throw fail("together", { status: 204 });
       return text;
     },
 
-    async cohere(key, sysPrompt, history, userText) {
-      const url = "https://api.cohere.com/v1/chat";
-      const chatHistory = history.map((m) => ({
-        role: m.role === "assistant" ? "CHATBOT" : "USER",
-        message: m.content,
-      }));
-      const res = await fetch(url, {
+    async cohere(key, sys, history, userText) {
+      const res = await fetch("https://api.cohere.com/v1/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
         body: JSON.stringify({
           model: "command-r-plus",
-          preamble: sysPrompt,
-          chat_history: chatHistory,
+          preamble: sys,
+          chat_history: history.map((m) => ({ role: m.role === "assistant" ? "CHATBOT" : "USER", message: m.content })),
           message: userText,
-          temperature: 0.8,
-          max_tokens: 400,
+          temperature: 0.8, max_tokens: 500,
         }),
       });
-      if (res.status === 429) throw { code: 429, provider: "cohere" };
-      if (!res.ok) throw { code: res.status, provider: "cohere" };
+      if (!res.ok) throw fail("cohere", res);
       const data = await res.json();
-      const text = data?.text?.trim();
-      if (!text) throw { code: 500, provider: "cohere", msg: "empty response" };
+      const text = data && data.text ? data.text.trim() : "";
+      if (!text) throw fail("cohere", { status: 204 });
       return text;
     },
   };
 
-  async function getAIResponse(userText, lang) {
-    const sysPrompt = buildSystemPrompt(lang);
-    const history = toLLMHistory();
+  /* Round-robin start index so a working key is reused, and a failing one is skipped first */
+  let providerCursor = 0;
 
-    if (!App.isOnline) {
-      return { text: offlineRespond(userText, lang), provider: "offline" };
+  async function askAI(userText, lang) {
+    if (!App.isOnline) return { text: Offline.respond(userText, lang), provider: "offline" };
+
+    const configured = App.providerOrder.filter((p) => App.apiKeys[p]);
+    if (!configured.length) {
+      const msg = lang === "ur"
+        ? "Abhi koi API key set nahi hai. Settings mein gear icon dabaa kar apni key add karein. Tab tak main offline mode mein hoon. "
+        : "No API key is set yet. Tap the gear icon and add at least one key. Until then I am in offline mode. ";
+      return { text: msg + Offline.respond(userText, lang), provider: "offline" };
     }
 
-    const availableProviders = App.providerOrder.filter((p) => App.apiKeys[p]);
-    if (availableProviders.length === 0) {
-      return {
-        text:
-          lang === "ur"
-            ? "Abhi tak koi API key configure nahi hui. Settings (⚙) mein ja kar apni Gemini, Groq, OpenRouter, Together ya Cohere key add karein — tab tak main offline mode mein madad karoon ga.\n\n" +
-              offlineRespond(userText, lang)
-            : "No API key is configured yet. Please add a Gemini, Groq, OpenRouter, Together AI, or Cohere key in Settings (⚙). Meanwhile, here's offline help:\n\n" +
-              offlineRespond(userText, lang),
-        provider: "none",
-      };
-    }
+    const sys = buildSystemPrompt();
+    const history = historyForLLM();
+    const n = configured.length;
+    const start = providerCursor % n;
 
-    let lastError = null;
-    for (const provider of availableProviders) {
+    for (let k = 0; k < n; k++) {
+      const provider = configured[(start + k) % n];
       try {
-        const key = App.apiKeys[provider];
-        const text = await Providers[provider](key, sysPrompt, history, userText);
+        const text = await Providers[provider](App.apiKeys[provider], sys, history, userText);
+        providerCursor = (start + k) % n; // stick with the engine that worked
         return { text, provider };
       } catch (err) {
-        lastError = err;
-        console.warn(`Provider ${provider} failed:`, err);
-        addMessage("sys", `⚠ ${provider.toUpperCase()} unavailable (${err?.code || "error"}) — rotating to next engine...`);
-        continue; // auto-failover to next provider
+        const code = err && err.status;
+        console.warn(`[JARVIS] ${provider} failed`, code, err);
+        // 429 = quota; 0 = network/CORS; 401/403 = bad key; 5xx = server -> all rotate to next engine
+        providerCursor = (start + k + 1) % n;
+        Glass.showSys(`${provider.toUpperCase()} ${code === 429 ? "quota reached" : "unavailable"} — switching engine...`);
       }
     }
 
-    // all providers failed -> graceful offline-style fallback
     return {
-      text:
-        (lang === "ur"
-          ? "Tamam AI engines is waqt jawab nahi de rahe (quota ya connection issue). Offline mode se madad kar raha hoon:\n\n"
-          : "All configured AI engines failed to respond right now (quota or connection issue). Falling back to offline assistance:\n\n") +
-        offlineRespond(userText, lang),
-      provider: "offline-fallback",
-      error: lastError,
+      text: (lang === "ur"
+        ? "Tamam AI engines abhi jawab nahi de rahe. Offline mode se madad kar raha hoon. "
+        : "All AI engines are unavailable right now, so I am switching to offline mode. ") + Offline.respond(userText, lang),
+      provider: "offline",
     };
   }
 
   /* ============================================================
-     CORE CONVERSATION HANDLER
+     CONVERSATION FLOW
      ============================================================ */
-  async function handleUserUtterance(rawText, source) {
-    const text = rawText.trim();
-    if (!text) return;
+  async function handleUtterance(raw) {
+    const text = raw.trim();
+    if (!text || App.processing) return;
+
+    // Before the first wake word, JARVIS stays passive in the background.
+    // After it has been woken once, it converses freely (no need to repeat the wake word).
+    const woke = hasWake(text);
+    if (!App.awake && !woke) {
+      Glass.showYou(text, true);
+      return;
+    }
+
+    App.processing = true;
+    Glass.newTurn();
+    Glass.showYou(text, false);
 
     const lang = detectLanguage(text);
     App.lastLang = lang;
 
-    addMessage("user", text, source === "voice" ? "🎤 voice" : "⌨ typed");
-    App.conversation.push({ role: "user", content: text, lang });
-
-    // ---- Wake word handling ----
-    if (isWakeWord(text) && !App.awaitingSalamReply && !App.awaitingWellbeingReply) {
-      const strippedCheck = text.replace(WAKE_WORD_RE, "").trim();
-      App.awaitingSalamReply = true;
-      const reply = "Assalamualaikum!";
-      respondAndSpeak(reply, "ur");
-      // If the user said more than just the wake word, treat remainder as their message too
-      if (strippedCheck.length > 2) {
-        App.awaitingSalamReply = false;
-        setTimeout(() => handleUserUtterance(strippedCheck, source), 900);
+    /* ---------- Wake-word greeting ---------- */
+    if (woke && !App.awaitingSalamReply && !App.awaitingWellbeingReply) {
+      const rest = stripWake(text);
+      App.awake = true;
+      // Just the wake word (or a greeting) -> Salam, then wait for the reply
+      if (rest.length < 3 || /^(hello|hey|hi|ok|okay|assalam.*|salam.*)$/i.test(rest)) {
+        App.awaitingSalamReply = true;
+        App.conversation.push({ role: "user", content: text, lang });
+        speakReply("Assalamualaikum", "ur");
+        return;
       }
-      return;
+      // "Hey Jarvis, open YouTube" -> greet is skipped, run the command directly
+      return routeCommand(rest, detectLanguage(rest), text);
     }
 
+    /* ---------- Reply to Salam ---------- */
     if (App.awaitingSalamReply) {
       App.awaitingSalamReply = false;
-      if (isSalamReply(text) || /^(walaikum|w\.?salam)/i.test(text)) {
+      App.conversation.push({ role: "user", content: text, lang });
+      if (isSalamReply(text)) {
         App.awaitingWellbeingReply = true;
-        const reply = lang === "ur" ? "Walaikum Assalam! Aap kaisay hain aaj?" : "Walaikum Assalam! How are you doing today?";
-        respondAndSpeak(reply, lang);
+        speakReply(lang === "ur" ? "Walaikum Assalam! Aap kaisay hain aaj?" : "Walaikum Assalam! How are you doing today?", lang);
         return;
       }
-      // fall through — treat as normal message but continue naturally
+      // User skipped the salam and asked something else -> treat as a normal message
     }
 
+    /* ---------- Reply to well-being question ---------- */
     if (App.awaitingWellbeingReply) {
       App.awaitingWellbeingReply = false;
-      const reply =
-        lang === "ur"
-          ? "Sun kar acha laga! Main hazir hoon — batayein main aapki kis tarah madad karoon: English practice, debate, ya kuch aur?"
-          : "Glad to hear that! I'm all set — how can I help you today? English practice, a debate topic, or something else?";
-      respondAndSpeak(reply, lang);
+      // If the user ignored the question and made a real request, answer it instead of swallowing it
+      if (looksLikeRequest(text)) return routeCommand(text, lang, text);
+
+      App.conversation.push({ role: "user", content: text, lang });
+      const negative = /\b(not (good|well|great|fine)|bad|sad|tired|sick|unwell|terrible|stressed|upset|worried)\b|\b(theek nahi|thik nahi|bura|udaas|pareshan|bimar|thaka|thak)\b/i.test(text);
+      let reply;
+      if (negative) {
+        reply = lang === "ur"
+          ? "Yeh sun kar afsos hua. Umeed hai jald behtar mehsoos karenge. Main aap ki kya madad kar sakta hoon?"
+          : "I'm sorry to hear that. I hope things get better soon. How can I help you today?";
+      } else {
+        reply = lang === "ur"
+          ? "Sun kar acha laga! Bataiye, main aaj aap ki kya madad karoon? English practice, debate, ya kuch aur?"
+          : "Glad to hear that! How can I help you today? English practice, a debate, or something else?";
+      }
+      speakReply(reply, lang);
       return;
     }
 
-    // ---- Intent / navigation commands ----
-    const intent = matchIntent(text);
-    if (intent) {
-      if (intent.dynamic === "time") {
-        const now = new Date();
-        const timeStr = now.toLocaleTimeString();
-        respondAndSpeak(lang === "ur" ? `Abhi waqt hai ${timeStr}.` : `The current time is ${timeStr}.`, lang);
-        return;
-      }
-      if (intent.dynamic === "date") {
-        const now = new Date();
-        const dateStr = now.toLocaleDateString(undefined, { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-        respondAndSpeak(lang === "ur" ? `Aaj ki tareekh hai ${dateStr}.` : `Today's date is ${dateStr}.`, lang);
-        return;
-      }
-      if (intent.action) intent.action();
-      respondAndSpeak(lang === "ur" ? intent.ur : intent.en, lang);
-      return;
-    }
-
-    // ---- Quick local grammar nudge (non-blocking enrichment) ----
-    const grammarNote = quickGrammarCheck(text);
-
-    // ---- Route to AI (with auto-failover) or offline ----
-    setOrbState(State.THINKING);
-    try {
-      const { text: aiText, provider } = await getAIResponse(
-        grammarNote ? `${text}\n\n(System note: ${grammarNote})` : text,
-        lang
-      );
-      const finalReply = aiText;
-      respondAndSpeak(finalReply, lang, provider);
-    } catch (e) {
-      console.error(e);
-      const fallback = offlineRespond(text, lang);
-      respondAndSpeak(fallback, lang, "offline-error");
-    }
+    return routeCommand(text, lang, text);
   }
 
-  function respondAndSpeak(text, lang, providerTag) {
-    App.conversation.push({ role: "assistant", content: text, lang });
-    const meta = providerTag ? `via ${providerTag}` : undefined;
-    addMessage("jarvis", text, meta);
-    setOrbState(State.THINKING);
-    // small delay so THINKING -> SPEAKING transition is visible
-    setTimeout(() => {
-      TTS.speak(text, App.voicePref === "auto" ? lang : (App.voicePref === "ur-PK" ? "ur" : "en"), () => {
-        setOrbState(App.micOn ? State.LISTENING : State.DORMANT);
-      });
-    }, 250);
+  /* Does this utterance look like a real request/question rather than a "how are you" answer? */
+  function looksLikeRequest(text) {
+    const t = text.trim().toLowerCase();
+    if (/\b(explain|teach|tell|give|show|open|start|help|correct|practice|practise|debate|interview|write|what|why|how|when|where|who|can you|could you|please|sikhao|batao|samjhao|kholo|kya|kaise|kyun)\b/.test(t)) {
+      // "how are you" style pleasantries are NOT requests
+      if (/^(how are you|and you|aap kaisay|aap kaise|tum kaise)/.test(t)) return false;
+      return true;
+    }
+    return t.split(/\s+/).length > 9;
+  }
+
+  /* Intent check -> AI */
+  async function routeCommand(cmdText, lang, originalText) {
+    App.conversation.push({ role: "user", content: cmdText, lang });
+
+    const intent = matchIntent(cmdText);
+    if (intent) {
+      if (intent.dynamic === "time") {
+        const t = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+        return speakReply(lang === "ur" ? `Abhi waqt hai ${t}.` : `The time is ${t}.`, lang);
+      }
+      if (intent.dynamic === "date") {
+        const d = new Date().toLocaleDateString(undefined, { weekday: "long", year: "numeric", month: "long", day: "numeric" });
+        return speakReply(lang === "ur" ? `Aaj ki tareekh hai ${d}.` : `Today is ${d}.`, lang);
+      }
+      speakReply(lang === "ur" ? intent.ur : intent.en, lang);
+      // Give the spoken confirmation a moment before navigating away
+      setTimeout(() => openSite(intent.url), 1200);
+      return;
+    }
+
+    setOrb(State.THINKING, "Processing...");
+    Recognition.block();
+
+    const hint = grammarHint(originalText);
+    const prompt = hint ? `${cmdText}\n\n[Hidden coaching note, do not read aloud verbatim: ${hint}]` : cmdText;
+
+    try {
+      const { text } = await askAI(prompt, lang);
+      speakReply(text, lang);
+    } catch (e) {
+      console.error("askAI crashed", e);
+      speakReply(Offline.respond(cmdText, lang), lang);
+    }
   }
 
   /* ============================================================
-     EVENT WIRING
+     ORB TAP  -> unlock audio + start / stop voice mode
      ============================================================ */
+  function activateVoiceMode() {
+    // 1) UNLOCK AUDIO synchronously inside the user gesture
+    const unlocked = TTS.unlock();
+    App.audioUnlocked = unlocked || !TTS.supported ? true : false;
+    if (TTS.supported) App.audioUnlocked = true;
+
+    App.voiceMode = true;
+    Glass.newTurn();
+
+    if (!Recognition.supported) {
+      setOrb(State.DORMANT, "Voice recognition not supported here");
+      Glass.showSys("This browser has no speech recognition. Open JARVIS in Chrome or an Android WebView with microphone access.");
+      return;
+    }
+
+    // 2) Visual confirmation, then start listening
+    setOrb(State.LISTENING, "AUDIO UNLOCKED & LISTENING", 2200);
+    Glass.showSys('Audio unlocked. Say "Hello Jarvis" to begin.');
+    Recognition.start();
+
+    // After the pinned message expires, settle on the plain status line
+    setTimeout(() => {
+      if (App.voiceMode && App.state === State.LISTENING && Date.now() >= statusLockUntil) setStatus("Listening...");
+    }, 2300);
+  }
+
+  function deactivateVoiceMode() {
+    App.voiceMode = false;
+    App.awake = false;
+    App.awaitingSalamReply = false;
+    App.awaitingWellbeingReply = false;
+    App.processing = false;
+    TTS.stop();
+    Recognition.stop();
+    setOrb(State.DORMANT);
+  }
+
   el.orbWrap.addEventListener("click", () => {
-    if (!App.audioUnlocked) {
-      unlockAudio();
-    }
-    toggleMic();
-  });
-
-  el.micBtn.addEventListener("click", (e) => {
-    e.stopPropagation();
-    if (!App.audioUnlocked) unlockAudio();
-    toggleMic();
-  });
-
-  el.sendBtn.addEventListener("click", () => {
-    const val = el.textInput.value;
-    if (!val.trim()) return;
-    el.textInput.value = "";
-    handleUserUtterance(val, "text");
-  });
-
-  el.textInput.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      el.sendBtn.click();
+    if (!App.voiceMode) {
+      activateVoiceMode();
+    } else if (App.state === State.SPEAKING) {
+      // Tap while speaking = interrupt JARVIS and listen again
+      TTS.stop();
+      App.processing = false;
+      Recognition.unblock();
+      setOrb(State.LISTENING);
+    } else {
+      deactivateVoiceMode();
     }
   });
 
-  el.quickRow.addEventListener("click", (e) => {
-    const chip = e.target.closest(".chip");
-    if (!chip) return;
-    const cmd = chip.getAttribute("data-cmd");
-    if (cmd) handleUserUtterance(cmd, "text");
+  /* Resume audio + mic when the app returns to the foreground */
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && App.voiceMode) {
+      if (TTS.supported && window.speechSynthesis.paused) window.speechSynthesis.resume();
+      Recognition.scheduleRestart();
+    }
   });
 
+  /* ============================================================
+     SETTINGS MODAL
+     ============================================================ */
   el.settingsBtn.addEventListener("click", () => {
     el.key_gemini.value = App.apiKeys.gemini || "";
     el.key_groq.value = App.apiKeys.groq || "";
     el.key_openrouter.value = App.apiKeys.openrouter || "";
     el.key_together.value = App.apiKeys.together || "";
     el.key_cohere.value = App.apiKeys.cohere || "";
-    el.voicePref.value = App.voicePref || "auto";
+    el.voicePref.value = App.voicePref;
+    el.rateRange.value = App.rate;
+    el.pitchRange.value = App.pitch;
+    el.rateBadge.textContent = Number(App.rate).toFixed(2);
+    el.pitchBadge.textContent = Number(App.pitch).toFixed(2);
     el.settingsModal.classList.add("show");
   });
-
-  el.settingsModal.addEventListener("click", (e) => {
-    if (e.target === el.settingsModal) el.settingsModal.classList.remove("show");
-  });
+  el.rateRange.addEventListener("input", () => { el.rateBadge.textContent = Number(el.rateRange.value).toFixed(2); });
+  el.pitchRange.addEventListener("input", () => { el.pitchBadge.textContent = Number(el.pitchRange.value).toFixed(2); });
+  el.settingsModal.addEventListener("click", (e) => { if (e.target === el.settingsModal) el.settingsModal.classList.remove("show"); });
 
   el.saveKeysBtn.addEventListener("click", () => {
     App.apiKeys.gemini = el.key_gemini.value.trim();
@@ -797,40 +1005,28 @@
     App.apiKeys.together = el.key_together.value.trim();
     App.apiKeys.cohere = el.key_cohere.value.trim();
     App.voicePref = el.voicePref.value;
-    Storage.save();
+    App.rate = parseFloat(el.rateRange.value) || 1.0;
+    App.pitch = parseFloat(el.pitchRange.value) || 1.0;
+    providerCursor = 0;
+    Store.save();
     el.settingsModal.classList.remove("show");
-    addMessage("sys", "✅ API configuration saved locally.");
+    Glass.showSys("Settings saved.");
   });
 
   el.clearKeysBtn.addEventListener("click", () => {
-    Storage.clear();
-    el.key_gemini.value = "";
-    el.key_groq.value = "";
-    el.key_openrouter.value = "";
-    el.key_together.value = "";
-    el.key_cohere.value = "";
-    addMessage("sys", "🗑 All API keys cleared.");
+    Store.clearKeys();
+    ["gemini", "groq", "openrouter", "together", "cohere"].forEach((k) => { el["key_" + k].value = ""; });
+    Glass.showSys("All API keys cleared.");
   });
 
   /* ============================================================
-     BOOTSTRAP
+     BOOT
      ============================================================ */
   function init() {
-    Storage.load();
+    Store.load();
     setNetStatus();
-    setOrbState(State.DORMANT);
-    if (window.speechSynthesis) TTS.loadVoices();
-
-    addMessage("sys", "JARVIS AI — Created by IZHAR AFRIDI. System online.");
-    addMessage(
-      "jarvis",
-      "I'm JARVIS, your voice assistant. Tap the orb to unlock audio and start talking, or type below. Say \"Hello Jarvis\" any time to greet me."
-    );
-
-    if (!("SpeechRecognition" in window) && !("webkitSpeechRecognition" in window)) {
-      addMessage("sys", "ℹ Voice input unavailable on this browser — text mode is fully functional.");
-    }
+    setOrb(State.DORMANT);
+    if (!TTS.supported) Glass.showSys("Speech synthesis is not supported on this device.");
   }
-
   document.addEventListener("DOMContentLoaded", init);
 })();
