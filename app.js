@@ -1,54 +1,111 @@
 /* =========================================================================
    JARVIS — Created by IZHAR AFRIDI
-   Android WebView-hardened voice engine.
+   Android WebView voice engine  ·  "pulse listener" edition
 
-   RECOGNITION DESIGN (why it no longer freezes)
-   - continuous = false, interimResults = true: each recognition session is a
-     short, self-terminating "one utterance" session. Android WebView delivers
-     these reliably, whereas continuous mode often hangs silently.
-   - A supervisor loop restarts the session 300ms after 'end' / 'error' /
-     'nomatch'. Only ONE session may exist at a time (start guard + generation
-     counter), which removes the abort()->start() InvalidStateError race.
-   - Language falls back en-US -> ur-PK instantly when a session yields nothing
-     or the engine rejects the language.
-   - Every session has a hard timeout so a hung engine can never leave the UI
-     stuck on "LISTENING".
-   - The mic is stopped while JARVIS speaks (no echo) and a TTS watchdog
-     guarantees the mic always comes back.
+   WHY THE OLD VERSIONS FROZE ON "LISTENING..."
+   Android WebView's recognizer holds the microphone for the whole life of a
+   continuous session and often never delivers a result or an 'end' event.
+   The UI then waits forever.
+
+   HOW THIS VERSION AVOIDS IT
+   1. continuous = false, interimResults = false. Every session is one short,
+      self-terminating "pulse" that ends by itself after one utterance.
+   2. Exactly ONE recognizer instance exists at any time, and it is rebuilt
+      for every pulse (reusing an instance across sessions is a known freeze).
+   3. A pulse is restarted (300 ms) only after the previous one has ended:
+      after a result, an error, 'nomatch', or a plain 'end'.
+   4. The turn has an ABSOLUTE 8-second silence deadline that survives pulse
+      restarts. If no speech is detected in 8 s the app goes back to IDLE with
+      "Listening timed out. Tap Orb or say Hello Jarvis" and RELEASES the mic.
+   5. Once speech is detected, a separate hang guard force-flushes a session
+      that never returns a result.
+   6. The mic is fully released while JARVIS thinks and speaks (no echo, no
+      audio-focus fights), and a stuck-state watchdog guarantees the UI can
+      never stay on THINKING/SPEAKING forever.
    ========================================================================= */
 
 (function () {
   "use strict";
 
-  /* ----------------------------- CONSTANTS --------------------------- */
-  const RESTART_DELAY_MS = 300;       // requested graceful restart delay
-  const SESSION_TIMEOUT_MS = 12000;   // hard cap: a hung recognition session is force-restarted
-  const SPEAK_MAX_MS = 45000;         // TTS watchdog: never stay in "speaking" forever
-  const LANG_PRIMARY = "en-US";
-  const LANG_FALLBACK = "ur-PK";
-  const OWNER_NAME = "Izhar";
+  /* ======================================================================
+     CONFIG
+     ====================================================================== */
+  const CFG = {
+    LISTEN_TIMEOUT_MS: 8000,        // absolute silence deadline per listening turn
+    RESTART_DELAY_MS: 300,          // gap before the next recognition pulse
+    SPEECH_HANG_MS: 20000,          // max time a session may run after speech started
+    STOP_GRACE_MS: 2500,            // how long stop() gets to flush a pending result
+    RESUME_SETTLE_MS: 450,          // pause after TTS so the mic never hears its tail
+    CAPTURE_HOLD_MS: 600,           // keep "Captured: ..." readable before "Thinking"
+    CHUNK_WATCHDOG_MS: 4500,        // TTS chunk that never starts is retried / skipped
+    SPEAK_MAX_MS: 45000,            // hard cap for one spoken reply
+    STUCK_MS: 75000,                // THINKING/SPEAKING longer than this = recover
+    API_TIMEOUT_MS: 10000,          // per-provider request timeout
+    API_TOTAL_MS: 30000,            // total time budget across all providers
+    MAX_TOKENS: 700,
+    MIC_PREFLIGHT_MS: 3500,
+    PREFLIGHT_MIC_PERMISSION: true, // request+release mic via getUserMedia before the first pulse
+    IDLE_WAKE_STANDBY: false,       // true = after a timeout keep single-shot wake-word pulses running
+    LANG_PRIMARY: "en-US",
+    LANG_FALLBACK: "ur-PK",
+    OWNER_NAME: "Izhar",
+  };
+
+  /* Model IDs live in one place. On a 400/404 (model retired) the next ID in the list is tried
+     automatically, and the one that worked is remembered.
+     Verified against provider deprecation pages on 28 Sep 2026:
+       - gemini-2.0-flash          shut down 1 Jun 2026
+       - groq llama-3.3-70b-versatile  shut down 16 Aug 2026 (free/developer tier)
+       - cohere command-r-plus alias   retired 15 Sep 2025                                   */
+  const MODELS = {
+    gemini: ["gemini-3.5-flash", "gemini-3.1-flash-lite"],
+    groq: ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "llama-3.3-70b-versatile"],
+    openrouter: ["openrouter/free", "meta-llama/llama-3.3-70b-instruct:free"],
+    together: ["meta-llama/Llama-3.3-70B-Instruct-Turbo", "openai/gpt-oss-120b"],
+    cohere: ["command-a-03-2025", "command-r-plus-08-2024"],
+  };
 
   const State = { DORMANT: "dormant", LISTENING: "listening", THINKING: "thinking", SPEAKING: "speaking" };
 
-  const STATUS = {
-    IDLE: "Tap orb to start voice mode",
-    MIC: "Mic Active - Speak Now",
-    PROCESSING: "Processing Voice...",
+  /* Exact texts requested for the SYSTEM box */
+  const MSG = {
+    MIC_ACTIVE: "Mic Active: Listening for your voice...",
+    CAPTURED: (t) => "Captured: " + (t.length > 160 ? t.slice(0, 160) + "…" : t),
+    THINKING: "JARVIS Thinking...",
     SPEAKING: "JARVIS Speaking...",
-    NO_KEY: "API Key Missing - Click Settings (⚙️)",
-    MIC_BLOCKED: "Microphone blocked - allow mic access",
-    UNLOCKED: "AUDIO UNLOCKED & LISTENING",
+    TIMEOUT: "Listening timed out. Tap Orb or say Hello Jarvis",
+    NO_KEY: "⚠️ No API Key saved. Tap Settings (⚙️) to enter key.",
+    IDLE_HINT: "Tap the orb to start voice mode",
+    STARTING: "Audio unlocked. Starting microphone...",
+    MIC_DENIED: "🎤 Microphone blocked (not-allowed). Enable the Microphone permission for this app in Android Settings, then tap the orb.",
+    SVC_DENIED: "🎤 Speech service not available (service-not-allowed). Make sure the Google app / speech services are enabled, then tap the orb.",
+    NO_SR: "Speech recognition is not available in this WebView. Try Chrome, or check the app's microphone permission.",
+    NET_ERR: "Speech service could not reach the network (error: network). Retrying...",
+    AUDIO_CAPTURE: "Microphone busy or unavailable (error: audio-capture). Retrying...",
+    NO_TTS: "Speech synthesis is not supported on this device.",
+    NO_VOICE: "Voice output unavailable on this device - showing text only.",
+    NO_KEY_SPOKEN: "API key missing. Please tap the settings gear and add a key.",
+    NO_KEY_SPOKEN_UR: "API key nahi mili. Settings mein gear icon dabaa kar key add karein.",
   };
+
+  const SHORT_STATUS = {
+    [State.DORMANT]: "Tap orb to start voice mode",
+    [State.LISTENING]: "Listening...",
+    [State.THINKING]: "Thinking...",
+    [State.SPEAKING]: "JARVIS Speaking...",
+  };
+
+  const WAKE_GREETING = "Assalamualaikum " + CFG.OWNER_NAME + "! How can I help you today?";
 
   /* ----------------------------- STATE ------------------------------- */
   const App = {
     audioUnlocked: false,
-    voiceMode: false,       // user turned voice mode on (mic supervisor should keep running)
+    active: false,          // voice mode is on (a conversation is in progress)
+    starting: false,        // between the orb tap and the first recognition pulse
     state: State.DORMANT,
-    awake: false,
-    awaitingSalamReply: false,
-    awaitingWellbeingReply: false,
-    busy: false,            // true from "final transcript accepted" until JARVIS finished replying
+    stateSince: Date.now(),
+    flow: 0,                // bumped on every new utterance / interrupt / stop; stale async work checks it
+    keyMissing: false,
     conversation: [],
     lastLang: "en",
     apiKeys: { gemini: "", groq: "", openrouter: "", together: "", cohere: "" },
@@ -85,18 +142,21 @@
     pitchBadge: $("pitchBadge"),
   };
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
   /* ============================================================
      PERSISTENCE
      ============================================================ */
+  const EMPTY_KEYS = () => ({ gemini: "", groq: "", openrouter: "", together: "", cohere: "" });
+
   const Store = {
     load() {
       try {
-        const raw = localStorage.getItem("jarvis_api_keys");
-        if (raw) App.apiKeys = Object.assign(App.apiKeys, JSON.parse(raw));
         App.voicePref = localStorage.getItem("jarvis_voice_pref") || "auto";
         App.rate = parseFloat(localStorage.getItem("jarvis_rate")) || 1.0;
         App.pitch = parseFloat(localStorage.getItem("jarvis_pitch")) || 1.0;
       } catch (e) { console.warn("Store.load failed", e); }
+      this.hasAnyKey();
     },
     save() {
       try {
@@ -108,106 +168,101 @@
     },
     clearKeys() {
       try { localStorage.removeItem("jarvis_api_keys"); } catch (e) { /* ignore */ }
-      App.apiKeys = { gemini: "", groq: "", openrouter: "", together: "", cohere: "" };
+      App.apiKeys = EMPTY_KEYS();
     },
-    /* Re-read straight from localStorage so a key saved in another moment is never missed */
+    /* Always re-reads localStorage (the source of truth) before answering. */
     hasAnyKey() {
+      let parsed = {};
       try {
         const raw = localStorage.getItem("jarvis_api_keys");
-        if (raw) {
-          const parsed = JSON.parse(raw);
-          App.apiKeys = Object.assign(App.apiKeys, parsed);
-        }
-      } catch (e) { /* ignore */ }
+        if (raw) parsed = JSON.parse(raw) || {};
+      } catch (e) { parsed = {}; }
+      App.apiKeys = Object.assign(EMPTY_KEYS(), parsed);
       return App.providerOrder.some((p) => !!(App.apiKeys[p] && String(App.apiKeys[p]).trim()));
     },
   };
 
+  function refreshKeyState() {
+    App.keyMissing = !Store.hasAnyKey();
+    System.render();
+  }
+
   /* ============================================================
-     UI HELPERS  (status line + glass "system" box)
+     VIEW: orb + status line, glass box, SYSTEM row
      ============================================================ */
-  let statusLockUntil = 0; // while now < this, passive listening updates don't overwrite the status text
+  const View = {
+    orb(state) {
+      App.state = state;
+      App.stateSince = Date.now();
+      el.orb.className = "orb " + state;
+      el.orbWrap.classList.toggle("active", state !== State.DORMANT);
+      this.status(SHORT_STATUS[state]);
+    },
+    status(text) {
+      if (el.statusLine.textContent === text) return;
+      el.statusLine.textContent = text;
+      el.statusLine.classList.remove("flash");
+      void el.statusLine.offsetWidth; // restart the CSS animation
+      el.statusLine.classList.add("flash");
+    },
+  };
 
-  function setStatus(text) {
-    if (el.statusLine.textContent === text) return;
-    el.statusLine.textContent = text;
-    el.statusLine.classList.remove("flash");
-    void el.statusLine.offsetWidth; // restart CSS animation
-    el.statusLine.classList.add("flash");
-  }
-
-  /* lockMs > 0 pins a message so quick passive updates (recognition onstart) can't clobber it */
-  function setOrb(state, statusText, lockMs) {
-    App.state = state;
-    el.orb.className = "orb " + state;
-    el.orbWrap.classList.toggle("active", state !== State.DORMANT);
-    const defaults = {
-      [State.DORMANT]: STATUS.IDLE,
-      [State.LISTENING]: STATUS.MIC,
-      [State.THINKING]: STATUS.PROCESSING,
-      [State.SPEAKING]: STATUS.SPEAKING,
-    };
-    const now = Date.now();
-    if (statusText) {
-      statusLockUntil = lockMs ? now + lockMs : 0;
-      setStatus(statusText);
-    } else if (now >= statusLockUntil || state === State.SPEAKING || state === State.THINKING) {
-      statusLockUntil = 0;
-      setStatus(defaults[state]);
-    }
-    // else: a lock is active -> keep the pinned message, only the orb animation changes
-    updateKeyBanner();
-  }
-
-  /*
-   * Persistent warning: when no API key exists, keep it visible in the SYSTEM row of the glass box
-   * for as long as we are idle/listening, so it can't be missed. Never interrupts speaking/thinking.
-   */
-  function updateKeyBanner() {
-    if (App.state === State.LISTENING || App.state === State.DORMANT) {
-      if (!Store.hasAnyKey()) Glass.sys(STATUS.NO_KEY);
-    }
-  }
-
-  /*
-   * Glass box rows:
-   *   LIVE   - real-time recognised speech (proves the mic is hearing you)
-   *   YOU    - the accepted final transcript
-   *   JARVIS - the reply text
-   *   SYSTEM - notices / errors
-   */
+  /* Glass box rows, always in this order:  SYSTEM  /  YOU  /  JARVIS */
   const Glass = {
+    built: false,
     rows: {},
-    _clearEmpty() { if (el.gEmpty && el.gEmpty.parentNode) el.gEmpty.remove(); },
-    _row(key, cls, tag) {
-      if (this.rows[key]) return this.rows[key];
-      this._clearEmpty();
-      const row = document.createElement("div");
-      row.className = "g-row " + cls;
-      const t = document.createElement("span"); t.className = "g-tag"; t.textContent = tag;
-      const x = document.createElement("div"); x.className = "g-text";
-      row.appendChild(t); row.appendChild(x);
-      el.glass.appendChild(row);
-      this.rows[key] = row;
-      return row;
+    build() {
+      if (this.built) return;
+      this.built = true;
+      if (el.gEmpty && el.gEmpty.parentNode) el.gEmpty.remove();
+      [["sys", "sys", "System"], ["you", "you", "You"], ["jarvis", "jarvis", "JARVIS"]].forEach((d) => {
+        const row = document.createElement("div");
+        row.className = "g-row " + d[1];
+        const tag = document.createElement("span");
+        tag.className = "g-tag";
+        tag.textContent = d[2];
+        const text = document.createElement("div");
+        text.className = "g-text";
+        row.appendChild(tag);
+        row.appendChild(text);
+        el.glass.appendChild(row);
+        this.rows[d[0]] = { row: row, text: text };
+      });
+      this.rows.you.row.style.display = "none";
+      this.rows.jarvis.row.style.display = "none";
     },
-    _set(key, cls, tag, text, interim) {
-      const row = this._row(key, cls, tag);
-      row.classList.toggle("interim", !!interim);
-      row.querySelector(".g-text").textContent = text;
-      el.glass.scrollTop = el.glass.scrollHeight;
-    },
-    live(text) { this._set("live", "you interim", "Live Transcript", text, true); },
-    you(text) { this.drop("live"); this._set("you", "you", "You", text, false); },
-    jarvis(text) { this._set("jarvis", "jarvis", "JARVIS", text, false); },
-    sys(text) { this._set("sys", "sys", "System", text, false); },
-    drop(key) {
+    _set(key, text) {
+      this.build();
       const r = this.rows[key];
-      if (r) { r.remove(); delete this.rows[key]; }
+      r.text.textContent = text;
+      r.row.style.display = text ? "" : "none";
     },
-    newTurn() {
-      el.glass.innerHTML = "";
-      this.rows = {};
+    setSys(text, kind) {
+      this._set("sys", text);
+      const color = kind === "error" ? "#ff8fa3" : kind === "warn" ? "#ffd27f" : "#9fe9f0";
+      this.rows.sys.text.style.color = color;
+      this.rows.sys.text.style.fontSize = "13px";
+      this.rows.sys.text.style.fontStyle = "normal";
+      el.glass.scrollTop = 0;
+    },
+    setYou(text) { this._set("you", text ? text : ""); },
+    setJarvis(text) { this._set("jarvis", text ? text : ""); },
+    clearTurn() { this.setYou(""); this.setJarvis(""); },
+  };
+
+  /* The SYSTEM row = main state line + optional diagnostic line + sticky API-key warning. */
+  const System = {
+    main: MSG.IDLE_HINT,
+    kind: "info",
+    detailText: "",
+    set(text, kind) { this.main = text; this.kind = kind || "info"; this.render(); },
+    detail(text) { this.detailText = text || ""; this.render(); },
+    render() {
+      const lines = [this.main];
+      if (this.detailText) lines.push(this.detailText);
+      if (App.keyMissing && this.main !== MSG.NO_KEY) lines.push(MSG.NO_KEY);
+      const kind = App.keyMissing && this.kind === "info" ? "warn" : this.kind;
+      Glass.setSys(lines.join("\n"), kind);
     },
   };
 
@@ -216,8 +271,8 @@
     el.netStatus.classList.toggle("online", App.isOnline);
     el.netStatusText.textContent = App.isOnline ? "ONLINE" : "OFFLINE";
   }
-  window.addEventListener("online", () => { setNetStatus(); Glass.sys("Connection restored - AI engines available."); });
-  window.addEventListener("offline", () => { setNetStatus(); Glass.sys("Offline - using local backup mode."); });
+  window.addEventListener("online", () => { setNetStatus(); System.detail("Connection restored - AI engines available."); });
+  window.addEventListener("offline", () => { setNetStatus(); System.detail("Offline - using local backup mode."); });
 
   /* ============================================================
      LANGUAGE DETECTION  (Urdu / Roman Urdu / English / Minglish)
@@ -250,20 +305,22 @@
   /* ============================================================
      WAKE WORD / SALAM / INTENTS
      ============================================================ */
-  // Recogniser frequently mishears "Jarvis"; accept the common variants.
-  const WAKE_RE = /\b(jarvis|jarvish|jervis|javis|jarwis|jarves|garvis|jarvice|service\s+jarvis)\b/i;
-  const WAKE_STRIP_RE = /\b(hello|hey|hi|ok|okay)?[\s,]*(jarvis|jarvish|jervis|javis|jarwis|jarves|garvis|jarvice)\b[\s,.!?]*/ig;
+  // Recognizers often mishear "Jarvis"; accept the usual variants.
+  const WAKE_RE = /\b(jarvis|jarvish|jervis|javis|jarwis|jarves|garvis|jarvice|jarvi)\b/i;
+  const WAKE_STRIP_RE = /\b(hello|hey|hi|ok|okay)?[\s,]*(jarvis|jarvish|jervis|javis|jarwis|jarves|garvis|jarvice|jarvi)\b[\s,.!?]*/ig;
 
-  function hasWake(text) {
-    return WAKE_RE.test(text) || /\b(hello|hey|hi)\s+(service|jar\s?vis|jar\s?wiss)\b/i.test(text);
-  }
+  function hasWake(text) { return WAKE_RE.test(text) || /\b(hello|hey|hi)\s+service\b/i.test(text); }
   function stripWake(text) { return text.replace(WAKE_STRIP_RE, " ").replace(/\s+/g, " ").trim(); }
-  function isSalamReply(text) {
-    return /(walaikum|wa\s?alaikum|walekum|valaikum|alaikum|w\.?\s?salam|salam|assalam|assalamu)/i.test(text);
+  function isSalamOnly(text) {
+    const t = text.trim().toLowerCase();
+    return t.split(/\s+/).length <= 5 && /^(assalam|assalamu|salam|walaikum|wa\s?alaikum|walekum|valaikum|w\.?\s?salam)/.test(t);
   }
 
   function openSite(url) {
-    try { window.open(url, "_blank"); } catch (e) { window.location.href = url; }
+    try {
+      const w = window.open(url, "_blank");
+      if (!w) window.location.href = url;
+    } catch (e) { window.location.href = url; }
   }
 
   const INTENTS = [
@@ -279,12 +336,13 @@
   function matchIntent(text) { return INTENTS.find((i) => i.re.test(text)) || null; }
 
   /* ============================================================
-     SPEECH SYNTHESIS  (mobile-hardened, with watchdog)
+     SPEECH SYNTHESIS  (mobile-hardened; onEnd fires at most once)
      ============================================================ */
   const TTS = {
     voices: [],
     supported: "speechSynthesis" in window && "SpeechSynthesisUtterance" in window,
     token: 0,
+    sess: null,
 
     loadVoices() {
       if (!this.supported) return;
@@ -292,13 +350,21 @@
       if (v && v.length) this.voices = v;
     },
 
+    /* Prefers on-device (offline) voices so the greeting never waits on the network. */
     pickVoice(lang) {
       if (!this.voices.length) this.loadVoices();
       const V = this.voices;
       if (!V.length) return null;
-      const by = (re) => V.find((v) => re.test((v.lang || "").replace("_", "-")));
-      if (lang === "ur") return by(/^ur/i) || by(/^hi/i) || by(/^en-IN/i) || by(/^en-GB/i) || by(/^en/i) || V[0];
-      return by(/^en-GB/i) || by(/^en-US/i) || by(/^en-IN/i) || by(/^en/i) || V[0];
+      const order = lang === "ur"
+        ? [/^ur/i, /^hi/i, /^en-IN/i, /^en-GB/i, /^en/i]
+        : [/^en-GB/i, /^en-US/i, /^en-IN/i, /^en/i];
+      for (const localOnly of [true, false]) {
+        for (const re of order) {
+          const v = V.find((x) => re.test((x.lang || "").replace("_", "-")) && (!localOnly || x.localService === true));
+          if (v) return v;
+        }
+      }
+      return V[0];
     },
 
     chunk(text) {
@@ -320,7 +386,7 @@
       return final;
     },
 
-    /* MUST run synchronously inside the orb tap (user gesture) */
+    /* Must run synchronously inside the orb tap (a user gesture). */
     unlock() {
       if (!this.supported) return false;
       try {
@@ -342,49 +408,60 @@
 
     stop() {
       this.token++;
+      if (this.sess) { this.sess.clear(); this.sess = null; }
       try { window.speechSynthesis.cancel(); } catch (e) { /* ignore */ }
     },
 
     /*
      * speak(text, lang, onStart, onEnd)
-     * onEnd(ok) is GUARANTEED to fire exactly once (watchdog), so the mic can never stay dead.
+     * onEnd(ok) fires exactly once unless speech was superseded / stopped by a newer call.
      */
     speak(text, lang, onStart, onEnd) {
-      let ended = false;
-      const done = (ok) => { if (ended) return; ended = true; if (onEnd) onEnd(ok); };
-
-      if (!this.supported || !App.audioUnlocked) { done(false); return; }
-      const chunks = this.chunk(text);
-      if (!chunks.length) { done(true); return; }
-
-      const token = ++this.token;
+      // Supersede whatever is running. cancel() is only called when something is actually queued:
+      // cancel()+speak() in the same tick can silently drop the new utterance on Chrome for Android.
+      this.token++;
+      if (this.sess) { this.sess.clear(); this.sess = null; }
+      const token = this.token;
       const synth = window.speechSynthesis;
-      try { synth.cancel(); } catch (e) { /* ignore */ }
+
+      const chunks = this.supported && App.audioUnlocked ? this.chunk(text) : [];
+      if (!chunks.length) { setTimeout(() => { if (token === this.token && onEnd) onEnd(false); }, 0); return; }
+
+      try { if (synth.speaking || synth.pending) synth.cancel(); } catch (e) { /* ignore */ }
       this.loadVoices();
       const voice = this.pickVoice(lang);
+
+      let finished = false;
       let idx = 0;
       let started = false;
+      const timers = new Set();
+      let keepAlive = null;
 
-      const overall = setTimeout(() => {
-        try { synth.cancel(); } catch (e) { /* ignore */ }
-        clearInterval(keepAlive);
-        done(started);
-      }, SPEAK_MAX_MS);
-
-      const keepAlive = setInterval(() => {
-        if (token !== this.token) { clearInterval(keepAlive); return; }
-        if (synth.speaking && synth.paused) synth.resume();
-      }, 4000);
+      const later = (fn, ms) => {
+        const t = setTimeout(() => { timers.delete(t); fn(); }, ms);
+        timers.add(t);
+        return t;
+      };
+      const drop = (t) => { if (t) { clearTimeout(t); timers.delete(t); } };
+      const clearAll = () => { timers.forEach(clearTimeout); timers.clear(); if (keepAlive) { clearInterval(keepAlive); keepAlive = null; } };
+      const alive = () => token === this.token && !finished;
+      const sess = { clear() { finished = true; clearAll(); } };
+      this.sess = sess;
 
       const finish = (ok) => {
-        clearTimeout(overall);
-        clearInterval(keepAlive);
-        if (token !== this.token) return; // superseded/stopped -> caller handles state
-        done(ok);
+        if (finished) return;
+        finished = true;
+        clearAll();
+        if (this.sess === sess) this.sess = null;
+        if (token === this.token && onEnd) onEnd(ok);
       };
 
-      const next = (retried) => {
-        if (token !== this.token) { clearTimeout(overall); clearInterval(keepAlive); return; }
+      // Chrome for Android sometimes leaves long speech paused
+      keepAlive = setInterval(() => { if (alive() && synth.speaking && synth.paused) synth.resume(); }, 4000);
+      later(() => { if (alive()) { try { synth.cancel(); } catch (e) { /* ignore */ } finish(started); } }, CFG.SPEAK_MAX_MS);
+
+      const playNext = (retried) => {
+        if (!alive()) return;
         if (idx >= chunks.length) { finish(true); return; }
 
         const u = new SpeechSynthesisUtterance(chunks[idx]);
@@ -395,37 +472,35 @@
         u.volume = 1;
 
         let settled = false;
-        let watchdog = null;
-        const advance = () => { if (settled) return; settled = true; clearTimeout(watchdog); idx++; next(false); };
+        let wd = null;
+        const advance = () => { if (settled || !alive()) return; settled = true; drop(wd); idx++; playNext(false); };
+        const markStarted = () => { if (!started) { started = true; if (alive() && onStart) onStart(); } };
 
-        u.onstart = () => {
-          clearTimeout(watchdog);
-          if (!started) { started = true; if (onStart) onStart(); }
-        };
+        u.onstart = () => { drop(wd); markStarted(); };
         u.onend = advance;
         u.onerror = (ev) => {
-          if (settled) return;
+          if (settled || !alive()) return;
           const err = ev && ev.error;
-          if (err === "interrupted" || err === "canceled") { settled = true; clearTimeout(watchdog); return; }
+          if (err === "interrupted" || err === "canceled") return; // caused by our own cancel()
           if (!retried) {
-            settled = true; clearTimeout(watchdog);
+            settled = true; drop(wd);
             try { synth.cancel(); } catch (e) { /* ignore */ }
+            // one retry with the engine's default voice (some Android voices fail to load)
             const u2 = new SpeechSynthesisUtterance(chunks[idx]);
             u2.rate = App.rate; u2.pitch = App.pitch; u2.volume = 1;
-            u2.onstart = () => { if (!started) { started = true; if (onStart) onStart(); } };
-            u2.onend = () => { idx++; next(false); };
-            u2.onerror = () => { idx++; next(false); };
-            try { synth.speak(u2); } catch (e) { idx++; next(false); }
+            u2.onstart = markStarted;
+            u2.onend = () => { if (alive()) { idx++; playNext(false); } };
+            u2.onerror = () => { if (alive()) { idx++; playNext(false); } };
+            try { synth.speak(u2); } catch (e) { idx++; playNext(false); }
           } else advance();
         };
 
-        // Engine silently dropped it -> retry once, then skip the chunk
-        watchdog = setTimeout(() => {
-          if (!started && !settled) {
-            try { synth.cancel(); } catch (e) { /* ignore */ }
-            if (!retried) { settled = true; next(true); } else advance();
-          }
-        }, 4500);
+        // The engine accepted the utterance but never started it -> retry once, then skip
+        wd = later(() => {
+          if (started || settled || !alive()) return;
+          try { synth.cancel(); } catch (e) { /* ignore */ }
+          if (!retried) { settled = true; playNext(true); } else advance();
+        }, CFG.CHUNK_WATCHDOG_MS);
 
         try {
           if (synth.paused) synth.resume();
@@ -433,7 +508,7 @@
         } catch (e) { advance(); }
       };
 
-      next(false);
+      playNext(false);
     },
   };
 
@@ -447,66 +522,83 @@
     }, 400);
   }
 
-  /*
-   * Speak a reply. Stops the mic first (no echo), shows text, then hands control
-   * back to the listener. `after` runs once speech is finished (or failed).
-   */
-  function speakReply(text, lang, after) {
-    const speakLang = App.voicePref === "auto" ? lang : App.voicePref;
-    Glass.jarvis(text);
-    App.conversation.push({ role: "assistant", content: text, lang });
-    if (App.conversation.length > 40) App.conversation = App.conversation.slice(-40);
-
-    Listener.pause();
-    setOrb(State.THINKING, STATUS.PROCESSING);
-
-    let started = false;
-    TTS.speak(
-      text,
-      speakLang,
-      () => { started = true; setOrb(State.SPEAKING, STATUS.SPEAKING); },
-      (ok) => {
-        App.busy = false;
-        if (!ok && !started) Glass.sys("Voice output unavailable on this device - showing text only.");
-        if (after) { try { after(); } catch (e) { console.warn(e); } }
-        // settle delay so the mic does not catch the audio tail
-        setTimeout(() => Listener.resume(), 450);
-      }
-    );
-  }
+  /* ============================================================
+     MIC PERMISSION PRE-FLIGHT
+     Asks Android for the mic through getUserMedia and RELEASES it at once.
+     Holding the stream open would lock the mic against SpeechRecognition,
+     which is exactly the freeze we are fixing, so every track is stopped.
+     A failure here is reported but never blocks the recognizer.
+     ============================================================ */
+  const Mic = {
+    preflight() {
+      return new Promise((resolve) => {
+        if (!CFG.PREFLIGHT_MIC_PERMISSION || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          resolve({ ok: true, skipped: true });
+          return;
+        }
+        let settled = false;
+        let timer = null;
+        const done = (r) => { if (settled) return; settled = true; clearTimeout(timer); resolve(r); };
+        timer = setTimeout(() => done({ ok: false, name: "Timeout" }), CFG.MIC_PREFLIGHT_MS);
+        let p;
+        try { p = navigator.mediaDevices.getUserMedia({ audio: true }); }
+        catch (e) { done({ ok: false, name: (e && e.name) || "Error" }); return; }
+        p.then(
+          (stream) => {
+            // release even if the timeout already fired (late permission grant)
+            try { stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* ignore */ }
+            done({ ok: true });
+          },
+          (e) => done({ ok: false, name: (e && e.name) || "Error" })
+        );
+      });
+    },
+  };
 
   /* ============================================================
-     SPEECH RECOGNITION  -  one-shot sessions + supervisor loop
-     ============================================================
-     State machine:
-        idle ──start()──► starting ──onstart──► running ──onend/onerror/nomatch/timeout──► idle
-                                                                        │
-                                                    Listener schedules restart (300ms)
-     Invariants:
-        * at most ONE SpeechRecognition instance alive (Listener.rec)
-        * every session is tagged with a generation id; events from old sessions are ignored
-        * a hard timeout kills sessions that hang without firing any event
-  */
+     SPEECH RECOGNITION  -  pulse listener
+     ------------------------------------------------------------
+        beginTurn()
+          ├─ arms the 8 s silence deadline (absolute, survives restarts)
+          └─ startSession()  ──►  one recognition pulse
+                                   ├─ result           → capture text, release mic, hand to Conversation
+                                   ├─ end/error/nomatch → wait 300 ms → next pulse (deadline still ticking)
+                                   └─ speech started   → deadline cancelled, hang guard armed
+          deadline fires → stop() flushes any pending result, else IDLE + timeout message
+     ============================================================ */
   const Listener = {
     supported: !!(window.SpeechRecognition || window.webkitSpeechRecognition),
     rec: null,
-    gen: 0,                 // generation counter for stale-event protection
+    gen: 0,                 // generation id: events from a destroyed session are ignored
     running: false,
-    paused: false,          // true while JARVIS is speaking/thinking
-    langIndex: 0,           // 0 = en-US, 1 = ur-PK
-    emptySessions: 0,       // consecutive sessions with no speech at all
-    heardThisSession: false,
-    sessionTimer: null,
+    sessionOver: false,     // 'error' and 'end' both fire for one failure; handle only the first
+    turnActive: false,
+    standby: false,
+    fatal: false,
+    langIdx: 0,             // 0 = en-US, 1 = ur-PK
+    emptyCount: 0,
+    speechDetected: false,
+    gotResult: false,
+    deadlineFired: false,
+    restartPending: false,
+    deadlineTimer: null,
+    hangTimer: null,
+    graceTimer: null,
     restartTimer: null,
-    restartPending: false,  // true only while a restart timeout is genuinely queued
-    permissionDenied: false,
 
-    currentLang() { return this.langIndex === 0 ? LANG_PRIMARY : LANG_FALLBACK; },
+    lang() { return this.langIdx === 0 ? CFG.LANG_PRIMARY : CFG.LANG_FALLBACK; },
 
-    /* Kill any live instance without letting its late events affect us */
-    _destroy() {
-      this.gen++; // invalidate old handlers
-      clearTimeout(this.sessionTimer);
+    clearTimers() {
+      clearTimeout(this.deadlineTimer);
+      clearTimeout(this.hangTimer);
+      clearTimeout(this.graceTimer);
+      clearTimeout(this.restartTimer);
+      this.restartPending = false;
+    },
+
+    /* Kill the live instance so none of its late events can reach us. */
+    destroySession() {
+      this.gen++;
       const r = this.rec;
       this.rec = null;
       this.running = false;
@@ -516,182 +608,205 @@
       }
     },
 
-    _create() {
-      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
-      const rec = new SR();
-      const myGen = ++this.gen;
-
-      rec.continuous = false;      // REQUIRED for Android WebView stability
-      rec.interimResults = true;   // live transcript
-      rec.maxAlternatives = 1;
-      rec.lang = this.currentLang();
-
-      const stale = () => myGen !== this.gen;
-
-      rec.onaudiostart = () => { if (stale()) return; /* mic hardware opened */ };
-
-      rec.onstart = () => {
-        if (stale()) return;
-        this.running = true;
-        this.heardThisSession = false;
-        if (App.voiceMode && !this.paused && !App.busy) setOrb(State.LISTENING);
-      };
-
-      rec.onspeechstart = () => { if (stale()) return; this.heardThisSession = true; };
-
-      rec.onresult = (event) => {
-        if (stale() || this.paused || App.busy) return;
-        this.heardThisSession = true;
-        this.emptySessions = 0;
-
-        let interim = "";
-        let finalText = "";
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const r = event.results[i];
-          const t = (r[0] && r[0].transcript) || "";
-          if (r.isFinal) finalText += t; else interim += t;
-        }
-
-        const live = (finalText || interim).trim();
-        if (live) {
-          Glass.live(live);                       // real-time proof the mic hears you
-          // instant wake word: react on the FIRST interim that contains it
-          if (!App.awake && !App.busy && hasWake(live)) {
-            triggerWake(live, /*fromInterim*/ !finalText.trim());
-            return;
-          }
-        }
-        if (finalText.trim()) handleFinal(finalText.trim());
-      };
-
-      rec.onnomatch = () => {
-        if (stale()) return;
-        this.onSessionOver("nomatch");
-      };
-
-      rec.onerror = (ev) => {
-        if (stale()) return;
-        const err = ev && ev.error ? ev.error : "unknown";
-        console.warn("[JARVIS] recognition error:", err);
-
-        if (err === "not-allowed" || err === "service-not-allowed") {
-          this.permissionDenied = true;
-          App.voiceMode = false;
-          this._destroy();
-          setOrb(State.DORMANT, STATUS.MIC_BLOCKED);
-          Glass.sys("Microphone permission denied. Grant microphone access to this app, then tap the orb again.");
-          return;
-        }
-        if (err === "language-not-supported") {
-          // instant fallback en-US <-> ur-PK
-          this.langIndex = this.langIndex === 0 ? 1 : 0;
-        }
-        if (err === "network") {
-          Glass.sys("Speech service unreachable - retrying...");
-        }
-        // 'no-speech', 'aborted', 'audio-capture', 'network': onend follows; also handled here for safety
-        this.onSessionOver(err);
-      };
-
-      rec.onend = () => {
-        if (stale()) return;
-        this.onSessionOver("end");
-      };
-
-      return rec;
+    stopAll() {
+      this.clearTimers();
+      this.destroySession();
+      this.turnActive = false;
+      this.standby = false;
     },
 
-    /* A session ended for any reason -> decide language + schedule restart in 300ms */
-    onSessionOver(reason) {
-      // Both 'error' and 'end' fire for one failed session; only handle the first one.
-      if (this.restartPending) return;
-      clearTimeout(this.sessionTimer);
-      this.running = false;
+    beginTurn() {
+      if (!App.active || this.fatal) return;
+      this.stopAll();
+      this.turnActive = true;
+      this.langIdx = 0;
+      this.emptyCount = 0;
+      this.speechDetected = false;
+      this.gotResult = false;
+      this.deadlineFired = false;
+      View.orb(State.LISTENING);
+      System.set(MSG.MIC_ACTIVE);
+      this.armDeadline();
+      this.startSession();
+    },
 
-      if (!this.heardThisSession && (reason === "end" || reason === "no-speech" || reason === "nomatch")) {
-        this.emptySessions++;
-        // en-US heard nothing twice in a row -> try ur-PK, then flip back if that is empty too
-        if (this.emptySessions >= 2) {
-          this.langIndex = this.langIndex === 0 ? 1 : 0;
-          this.emptySessions = 0;
-        }
+    startStandby() {
+      this.stopAll();
+      this.standby = true;
+      this.langIdx = 0;
+      this.emptyCount = 0;
+      this.gotResult = false;
+      this.startSession();
+    },
+
+    armDeadline() {
+      clearTimeout(this.deadlineTimer);
+      this.deadlineTimer = setTimeout(() => this.onDeadline(), CFG.LISTEN_TIMEOUT_MS);
+    },
+
+    startSession() {
+      if (!this.turnActive && !this.standby) return;
+      if (this.running) return;                  // one pulse at a time
+      this.destroySession();                     // always start from a fresh instance
+      this.restartPending = false;
+      try {
+        const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+        const rec = new SR();
+        const myGen = ++this.gen;
+        const stale = () => myGen !== this.gen;
+
+        rec.continuous = false;        // REQUIRED: continuous mode locks the mic in Android WebView
+        rec.interimResults = false;    // REQUIRED: only final results are delivered
+        rec.maxAlternatives = 1;
+        rec.lang = this.lang();
+
+        rec.onstart = () => { if (stale()) return; this.running = true; };
+        rec.onspeechstart = () => {
+          if (stale()) return;
+          this.speechDetected = true;
+          clearTimeout(this.deadlineTimer);           // the user is talking: silence deadline no longer applies
+          clearTimeout(this.hangTimer);
+          this.hangTimer = setTimeout(() => this.onHang(myGen), CFG.SPEECH_HANG_MS);
+        };
+        rec.onresult = (ev) => { if (stale()) return; this.onResult(ev); };
+        rec.onnomatch = () => { if (stale()) return; this.endSession("nomatch"); };
+        rec.onerror = (ev) => { if (stale()) return; this.onError(ev); };
+        rec.onend = () => { if (stale()) return; this.endSession("end"); };
+
+        this.rec = rec;
+        this.sessionOver = false;
+        rec.start();
+      } catch (e) {
+        console.warn("[JARVIS] recognition start failed:", e);
+        this.destroySession();
+        this.scheduleRestart(CFG.RESTART_DELAY_MS * 3);
       }
-      this.scheduleRestart(RESTART_DELAY_MS);
+    },
+
+    onResult(ev) {
+      let text = "";
+      for (let i = ev.resultIndex || 0; i < ev.results.length; i++) {
+        const r = ev.results[i];
+        if (r && r.isFinal !== false) text += " " + ((r[0] && r[0].transcript) || "");
+      }
+      text = text.replace(/\s+/g, " ").trim();
+      if (!text) return;
+
+      if (this.standby) {
+        if (!hasWake(text)) return;                   // session end restarts the standby pulse
+        this.stopAll();
+        App.active = true;
+        App.starting = false;
+        refreshKeyState();
+        onCaptured(text);
+        return;
+      }
+
+      if (!this.turnActive || this.gotResult) return;
+      this.gotResult = true;
+      this.clearTimers();
+      this.destroySession();                          // release the mic BEFORE anything else happens
+      this.turnActive = false;
+      onCaptured(text);
+    },
+
+    onError(ev) {
+      const err = (ev && ev.error) || "unknown";
+      console.warn("[JARVIS] recognition error:", err);
+
+      if (err === "not-allowed" || err === "service-not-allowed") {
+        this.fatal = true;
+        goIdle(err === "not-allowed" ? MSG.MIC_DENIED : MSG.SVC_DENIED, "error");
+        return;
+      }
+      if (err === "language-not-supported") {
+        this.langIdx = this.langIdx === 0 ? 1 : 0;     // instant en-US <-> ur-PK fallback
+        this.emptyCount = -1;                          // endSession() counts this pulse as empty; net effect 0
+        this.endSession("error:" + err, 50);
+        return;
+      }
+      if (err === "network") System.detail(MSG.NET_ERR);
+      else if (err === "audio-capture") System.detail(MSG.AUDIO_CAPTURE);
+      this.endSession("error:" + err);
+    },
+
+    /* A pulse finished for any reason without a usable result. */
+    endSession(reason, delay) {
+      if (this.sessionOver) return;
+      this.sessionOver = true;
+      this.running = false;
+      clearTimeout(this.hangTimer);
+      if (this.gotResult) return;                      // the result flow owns what happens next
+      if (!this.turnActive && !this.standby) return;
+
+      if (this.deadlineFired) { timeoutToIdle(); return; }   // stop() at the deadline flushed nothing
+
+      if (!this.speechDetected) {
+        this.emptyCount++;
+        if (this.emptyCount >= 2) {                    // two silent pulses on one language -> try the other
+          this.langIdx = this.langIdx === 0 ? 1 : 0;
+          this.emptyCount = 0;
+        }
+      } else {
+        this.speechDetected = false;                   // sound but no words: give a fresh silence window
+        if (this.turnActive) this.armDeadline();
+      }
+      this.scheduleRestart(delay == null ? CFG.RESTART_DELAY_MS : delay);
     },
 
     scheduleRestart(delay) {
       clearTimeout(this.restartTimer);
-      this.restartPending = false;
-      if (!App.voiceMode || this.paused || this.permissionDenied) return;
+      if (!this.turnActive && !this.standby) return;
       this.restartPending = true;
-      this.restartTimer = setTimeout(() => {
-        this.restartPending = false;
-        this.start();
-      }, delay);
+      this.restartTimer = setTimeout(() => { this.restartPending = false; this.startSession(); }, delay);
     },
 
-    start() {
-      if (!this.supported || !App.voiceMode || this.paused || this.permissionDenied) return;
-      if (App.busy) return;
-      if (this.running && this.rec) return;      // one session at a time
-
-      // Always build a fresh instance: reusing one across sessions is a classic WebView freeze
-      this._destroy();
-      try {
-        this.rec = this._create();
-        this.rec.start();
-      } catch (e) {
-        console.warn("[JARVIS] recognition start failed:", e);
-        this._destroy();
-        this.scheduleRestart(RESTART_DELAY_MS * 2);
-        return;
-      }
-
-      // Hard timeout: if the engine never fires end/error, kill and restart
-      clearTimeout(this.sessionTimer);
-      const g = this.gen;
-      this.sessionTimer = setTimeout(() => {
-        if (g !== this.gen) return;
-        console.warn("[JARVIS] recognition session timed out - restarting");
-        this._destroy();
-        this.scheduleRestart(RESTART_DELAY_MS);
-      }, SESSION_TIMEOUT_MS);
-    },
-
-    stop() {
-      clearTimeout(this.restartTimer);
-      this.restartPending = false;
-      this._destroy();
-    },
-
-    /* JARVIS is about to talk / think: silence the mic completely */
-    pause() {
-      this.paused = true;
-      clearTimeout(this.restartTimer);
-      this.restartPending = false;
-      this._destroy();
-    },
-
-    /* JARVIS finished: bring the mic back */
-    resume() {
-      this.paused = false;
-      this.emptySessions = 0;
-      this.langIndex = 0; // always start the next turn on en-US
-      if (App.voiceMode) {
-        setOrb(State.LISTENING);
-        this.start();
+    /* 8 s without any speech. stop() (not abort) lets a late, in-flight result still arrive. */
+    onDeadline() {
+      if (!this.turnActive || this.gotResult || this.speechDetected) return;
+      this.deadlineFired = true;
+      if (this.rec && this.running) {
+        try { this.rec.stop(); } catch (e) { /* ignore */ }
+        this.graceTimer = setTimeout(() => {
+          if (!this.gotResult && this.turnActive) timeoutToIdle();
+        }, CFG.STOP_GRACE_MS);
       } else {
-        setOrb(State.DORMANT);
+        timeoutToIdle();
       }
+    },
+
+    /* Speech began but the engine never produced a result. */
+    onHang(g) {
+      if (g !== this.gen || !this.turnActive || this.gotResult) return;
+      console.warn("[JARVIS] recognition hung after speech start - flushing");
+      try { if (this.rec) this.rec.stop(); } catch (e) { /* ignore */ }
+      this.graceTimer = setTimeout(() => {
+        if (g !== this.gen || this.gotResult || !this.turnActive) return;
+        this.destroySession();
+        this.speechDetected = false;
+        this.armDeadline();
+        this.scheduleRestart(CFG.RESTART_DELAY_MS);
+      }, CFG.STOP_GRACE_MS);
     },
   };
 
-  /* Supervisor: if anything stalls (e.g. WebView swallowed every event), revive the mic */
-  setInterval(() => {
-    if (App.voiceMode && !Listener.paused && !App.busy && !Listener.running && !Listener.restartPending) {
-      Listener.start();
-    }
-  }, 2500);
+  /* ============================================================
+     IDLE / SESSION END
+     ============================================================ */
+  function goIdle(message, kind) {
+    Listener.stopAll();
+    TTS.stop();
+    App.active = false;
+    App.starting = false;
+    App.flow++;
+    View.orb(State.DORMANT);
+    System.set(message || MSG.IDLE_HINT, kind || "info");
+  }
+
+  function timeoutToIdle() {
+    goIdle(MSG.TIMEOUT, "warn");
+    if (CFG.IDLE_WAKE_STANDBY && Listener.supported && !Listener.fatal) Listener.startStandby();
+  }
 
   /* ============================================================
      OFFLINE BACKUP BANK
@@ -770,7 +885,7 @@
   }
 
   /* ============================================================
-     SYSTEM PROMPT  (English coach + language adaptation)
+     SYSTEM PROMPT + HISTORY
      ============================================================ */
   function buildSystemPrompt() {
     return (
@@ -790,8 +905,21 @@
     );
   }
 
+  function remember(role, content, lang) {
+    App.conversation.push({ role: role, content: content, lang: lang });
+    if (App.conversation.length > 40) App.conversation = App.conversation.slice(-40);
+  }
+
+  /* Last 12 turns, starting with a user turn, roles alternating (some APIs reject anything else). */
   function historyForLLM() {
-    return App.conversation.slice(-12).map((m) => ({ role: m.role === "user" ? "user" : "assistant", content: m.content }));
+    const out = [];
+    for (const m of App.conversation.slice(-12)) {
+      const role = m.role === "user" ? "user" : "assistant";
+      if (!out.length && role !== "user") continue;
+      if (out.length && out[out.length - 1].role === role) out[out.length - 1].content += "\n" + m.content;
+      else out.push({ role: role, content: m.content });
+    }
+    return out;
   }
 
   /* ============================================================
@@ -804,129 +932,158 @@
     return e;
   }
 
+  /* fetch + timeout + status check + JSON parse, in one place. */
+  async function fetchJSON(provider, url, options) {
+    const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        if (ctl) { try { ctl.abort(); } catch (e) { /* ignore */ } }
+        reject(fail(provider, null));
+      }, CFG.API_TIMEOUT_MS);
+    });
+    try {
+      const opts = ctl ? Object.assign({}, options, { signal: ctl.signal }) : options;
+      const res = await Promise.race([fetch(url, opts), timeout]);
+      if (!res.ok) throw fail(provider, res);
+      return await Promise.race([res.json(), timeout]);
+    } catch (e) {
+      if (e && e.provider) throw e;
+      throw fail(provider, null);            // network error, CORS, abort
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /* Try the provider's model list in order; only "model gone / bad model" errors move to the next ID. */
+  const modelIdx = {};
+  async function withModels(provider, run) {
+    const list = MODELS[provider];
+    const first = modelIdx[provider] || 0;
+    let lastErr = null;
+    for (let n = 0; n < list.length; n++) {
+      const idx = (first + n) % list.length;
+      try {
+        const out = await run(list[idx]);
+        modelIdx[provider] = idx;
+        return out;
+      } catch (e) {
+        lastErr = e;
+        if (!(e && (e.status === 400 || e.status === 404))) throw e;
+      }
+    }
+    throw lastErr;
+  }
+
+  function cleanReply(t) {
+    return String(t || "").replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
+  }
+
+  async function openaiChat(provider, url, headers, model, sys, history, userText, extra) {
+    const body = Object.assign({
+      model: model,
+      messages: [{ role: "system", content: sys }].concat(history, [{ role: "user", content: userText }]),
+      temperature: 0.8,
+      max_tokens: CFG.MAX_TOKENS,
+    }, extra || {});
+    const data = await fetchJSON(provider, url, {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, headers),
+      body: JSON.stringify(body),
+    });
+    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+    const text = cleanReply(msg && msg.content);
+    if (!text) throw fail(provider, { status: 204 });
+    return text;
+  }
+
   const Providers = {
-    async gemini(key, sys, history, userText) {
-      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${encodeURIComponent(key)}`;
-      const contents = history.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
-      contents.push({ role: "user", parts: [{ text: userText }] });
-      const res = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: sys }] },
-          contents,
-          generationConfig: { temperature: 0.8, maxOutputTokens: 500 },
-        }),
+    gemini(key, sys, history, userText) {
+      return withModels("gemini", async (model) => {
+        const contents = history.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.content }] }));
+        contents.push({ role: "user", parts: [{ text: userText }] });
+        const data = await fetchJSON("gemini", `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: sys }] },
+            contents: contents,
+            generationConfig: { temperature: 0.8, maxOutputTokens: CFG.MAX_TOKENS + 300 },
+          }),
+        });
+        const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
+        const text = cleanReply(parts ? parts.map((p) => p.text || "").join(" ") : "");
+        if (!text) throw fail("gemini", { status: 204 });
+        return text;
       });
-      if (!res.ok) throw fail("gemini", res);
-      const data = await res.json();
-      const parts = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-      const text = parts ? parts.map((p) => p.text || "").join(" ").trim() : "";
-      if (!text) throw fail("gemini", { status: 204 });
-      return text;
     },
 
-    async groq(key, sys, history, userText) {
-      const res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: "llama-3.3-70b-versatile",
-          messages: [{ role: "system", content: sys }, ...history, { role: "user", content: userText }],
-          temperature: 0.8, max_tokens: 500,
-        }),
-      });
-      if (!res.ok) throw fail("groq", res);
-      const data = await res.json();
-      const text = data && data.choices && data.choices[0] && data.choices[0].message ? (data.choices[0].message.content || "").trim() : "";
-      if (!text) throw fail("groq", { status: 204 });
-      return text;
+    groq(key, sys, history, userText) {
+      return withModels("groq", (model) =>
+        openaiChat("groq", "https://api.groq.com/openai/v1/chat/completions", { Authorization: `Bearer ${key}` },
+          model, sys, history, userText, /gpt-oss/i.test(model) ? { reasoning_effort: "low" } : {}));
     },
 
-    async openrouter(key, sys, history, userText) {
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
+    openrouter(key, sys, history, userText) {
+      return withModels("openrouter", (model) =>
+        openaiChat("openrouter", "https://openrouter.ai/api/v1/chat/completions", {
           Authorization: `Bearer ${key}`,
           "HTTP-Referer": location.origin && location.origin !== "null" ? location.origin : "https://jarvis.local",
           "X-Title": "JARVIS by IZHAR AFRIDI",
-        },
-        body: JSON.stringify({
-          model: "meta-llama/llama-3.3-70b-instruct:free",
-          messages: [{ role: "system", content: sys }, ...history, { role: "user", content: userText }],
-          temperature: 0.8, max_tokens: 500,
-        }),
-      });
-      if (!res.ok) throw fail("openrouter", res);
-      const data = await res.json();
-      const text = data && data.choices && data.choices[0] && data.choices[0].message ? (data.choices[0].message.content || "").trim() : "";
-      if (!text) throw fail("openrouter", { status: 204 });
-      return text;
+        }, model, sys, history, userText));
     },
 
-    async together(key, sys, history, userText) {
-      const res = await fetch("https://api.together.xyz/v1/chat/completions", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: "meta-llama/Llama-3.3-70B-Instruct-Turbo",
-          messages: [{ role: "system", content: sys }, ...history, { role: "user", content: userText }],
-          temperature: 0.8, max_tokens: 500,
-        }),
-      });
-      if (!res.ok) throw fail("together", res);
-      const data = await res.json();
-      const text = data && data.choices && data.choices[0] && data.choices[0].message ? (data.choices[0].message.content || "").trim() : "";
-      if (!text) throw fail("together", { status: 204 });
-      return text;
+    together(key, sys, history, userText) {
+      return withModels("together", (model) =>
+        openaiChat("together", "https://api.together.xyz/v1/chat/completions", { Authorization: `Bearer ${key}` },
+          model, sys, history, userText));
     },
 
-    async cohere(key, sys, history, userText) {
-      const res = await fetch("https://api.cohere.com/v1/chat", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
-        body: JSON.stringify({
-          model: "command-r-plus",
-          preamble: sys,
-          chat_history: history.map((m) => ({ role: m.role === "assistant" ? "CHATBOT" : "USER", message: m.content })),
-          message: userText,
-          temperature: 0.8, max_tokens: 500,
-        }),
+    cohere(key, sys, history, userText) {
+      return withModels("cohere", async (model) => {
+        const data = await fetchJSON("cohere", "https://api.cohere.com/v2/chat", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${key}` },
+          body: JSON.stringify({
+            model: model,
+            messages: [{ role: "system", content: sys }].concat(history, [{ role: "user", content: userText }]),
+            temperature: 0.8,
+            max_tokens: CFG.MAX_TOKENS,
+          }),
+        });
+        const c = data && data.message && data.message.content;
+        const text = cleanReply(Array.isArray(c) ? c.map((p) => p.text || "").join(" ") : (typeof c === "string" ? c : ""));
+        if (!text) throw fail("cohere", { status: 204 });
+        return text;
       });
-      if (!res.ok) throw fail("cohere", res);
-      const data = await res.json();
-      const text = data && data.text ? data.text.trim() : "";
-      if (!text) throw fail("cohere", { status: 204 });
-      return text;
     },
   };
 
   let providerCursor = 0;
 
-  /* Returns { text, provider } or { missingKey:true } */
-  async function askAI(userText, lang) {
-    if (!App.isOnline) return { text: Offline.respond(userText, lang), provider: "offline" };
-
-    if (!Store.hasAnyKey()) return { missingKey: true };
-
+  /* Returns { text, provider }, or null if the user interrupted while it was running. */
+  async function askAI(userText, lang, history, flow) {
     const configured = App.providerOrder.filter((p) => App.apiKeys[p] && String(App.apiKeys[p]).trim());
+    const hist = history.slice();
+    while (hist.length && hist[hist.length - 1].role === "user") hist.pop(); // drop an unanswered dangling turn
     const sys = buildSystemPrompt();
-    const history = historyForLLM();
     const n = configured.length;
     const start = providerCursor % n;
+    const t0 = Date.now();
 
     for (let k = 0; k < n; k++) {
+      if (flow !== App.flow) return null;
+      if (Date.now() - t0 > CFG.API_TOTAL_MS) break;
       const provider = configured[(start + k) % n];
       try {
-        const text = await Providers[provider](String(App.apiKeys[provider]).trim(), sys, history, userText);
+        const text = await Providers[provider](String(App.apiKeys[provider]).trim(), sys, hist, userText);
         providerCursor = (start + k) % n;
-        return { text, provider };
+        return { text: text, provider: provider };
       } catch (err) {
         const code = err && err.status;
         console.warn(`[JARVIS] ${provider} failed`, code, err);
         providerCursor = (start + k + 1) % n;
-        Glass.sys(`${provider.toUpperCase()} ${code === 429 ? "quota reached" : "unavailable"} - switching engine...`);
+        if (flow === App.flow) System.detail(`${provider.toUpperCase()} ${code === 429 ? "quota reached" : "unavailable (" + (code || "network") + ")"} - switching engine...`);
       }
     }
 
@@ -939,224 +1096,211 @@
   }
 
   /* ============================================================
-     WAKE WORD  -  INSTANT hardcoded local response
+     CONVERSATION FLOW
      ============================================================ */
-  const WAKE_REPLY = `Assalamualaikum! How can I help you today ${OWNER_NAME}?`;
 
-  /*
-   * Called the moment "jarvis" appears in the transcript (even in an interim result).
-   * Speaks immediately with speechSynthesis, before any API work.
-   */
-  function triggerWake(transcript, fromInterim) {
-    if (App.busy) return;
-    App.busy = true;
-    App.awake = true;
+  /* Speak a reply, show its text, then (by default) go back to listening. */
+  function speakReply(text, lang, opts) {
+    opts = opts || {};
+    const flow = opts.flow != null ? opts.flow : App.flow;
+    if (flow !== App.flow) return;
+    const speakLang = App.voicePref === "auto" ? lang : App.voicePref;
+    Glass.setJarvis(text);
+    if (opts.remember !== false) remember("assistant", text, lang);
 
-    const rest = stripWake(transcript);
-    const onlyGreeting = rest.length < 3 || /^(hello|hey|hi|ok|okay|assalam.*|salam.*)$/i.test(rest);
+    let started = false;
+    TTS.speak(
+      text,
+      speakLang,
+      () => {
+        started = true;
+        if (flow !== App.flow) return;
+        View.orb(State.SPEAKING);
+        System.set(MSG.SPEAKING);
+      },
+      (ok) => {
+        if (flow !== App.flow) return;
+        if (!ok && !started) System.detail(MSG.NO_VOICE);
+        if (!App.active) return;
+        if (opts.next) opts.next(); else resumeListening(flow);
+      }
+    );
+  }
 
-    Glass.newTurn();
-    Glass.you(transcript);
+  function resumeListening(flow) {
+    setTimeout(() => { if (flow === App.flow && App.active) Listener.beginTurn(); }, CFG.RESUME_SETTLE_MS);
+  }
 
-    App.conversation.push({ role: "user", content: transcript, lang: "en" });
+  /* A final transcript arrived. The mic is already released at this point. */
+  function onCaptured(text) {
+    const flow = ++App.flow;
+    const lang = detectLanguage(text);
+    App.lastLang = lang;
+    try {
+      System.detail("");
+      Glass.setYou(text);
+      Glass.setJarvis("");
+      System.set(MSG.CAPTURED(text));
+      View.orb(State.THINKING);
 
-    if (onlyGreeting) {
-      App.awaitingSalamReply = false;      // the reply itself already asks how it can help
-      App.awaitingWellbeingReply = false;
-      speakReply(WAKE_REPLY, "en");
-      return;
+      if (hasWake(text)) { wakeFlow(text, flow); return; }
+      if (isSalamOnly(text)) {
+        speakReply(lang === "ur" ? "Walaikum Assalam! Bataiye, main aap ki kya madad kar sakta hoon?" : "Walaikum Assalam! How can I help you?", lang, { flow: flow, remember: false });
+        return;
+      }
+      routeFlow(text, lang, flow).catch((err) => flowFailed(err, text, lang, flow));
+    } catch (err) {
+      flowFailed(err, text, lang, flow);
     }
+  }
 
-    // "Hey Jarvis, open YouTube": greet first (instant, local), then run the command.
-    // Do it in one sentence chain so the mic stays closed once.
-    speakReply(WAKE_REPLY, "en", () => {
-      // after greeting, run the command that came with the wake word
-      setTimeout(() => {
-        if (!App.voiceMode) return;
-        App.busy = true;
-        routeCommand(rest, detectLanguage(rest), rest);
-      }, 200);
+  function flowFailed(err, text, lang, flow) {
+    console.error("[JARVIS] flow error", err);
+    if (flow !== App.flow) return;
+    speakReply(Offline.respond(text, lang), lang, { flow: flow });
+  }
+
+  /* "Hello Jarvis" / "Hey Jarvis" / "Jarvis": INSTANT local greeting, no API involved. */
+  function wakeFlow(text, flow) {
+    const rest = stripWake(text);
+    const greetingOnly = rest.length < 3 || /^(hello|hey|hi|ok|okay|assalam\w*|salam|walaikum\s*assalam)$/i.test(rest);
+    speakReply(WAKE_GREETING, "en", {
+      flow: flow,
+      next: greetingOnly ? null : () => {
+        routeFlow(rest, detectLanguage(rest), flow).catch((err) => flowFailed(err, rest, detectLanguage(rest), flow));
+      },
     });
   }
 
-  /* ============================================================
-     CONVERSATION FLOW
-     ============================================================ */
-  function handleFinal(raw) {
-    const text = raw.trim();
-    if (!text || App.busy) return;
+  async function routeFlow(text, lang, flow) {
+    const history = historyForLLM();          // taken BEFORE this turn is remembered
+    remember("user", text, lang);
 
-    // Wake word in a final result
-    if (hasWake(text) && !App.awake) { triggerWake(text, false); return; }
-    // Repeating the wake word later re-greets instantly too
-    if (hasWake(text) && App.awake && stripWake(text).length < 3) { triggerWake(text, false); return; }
-
-    // Before the first wake word JARVIS stays passive (but the live transcript still shows what it heard)
-    if (!App.awake) {
-      Glass.live(text);
-      Listener.scheduleRestart(RESTART_DELAY_MS);
-      return;
-    }
-
-    App.busy = true;
-    Glass.newTurn();
-    Glass.you(text);
-    setOrb(State.THINKING, STATUS.PROCESSING);
-
-    const lang = detectLanguage(text);
-    App.lastLang = lang;
-
-    if (App.awaitingSalamReply) {
-      App.awaitingSalamReply = false;
-      App.conversation.push({ role: "user", content: text, lang });
-      if (isSalamReply(text)) {
-        App.awaitingWellbeingReply = true;
-        return speakReply(lang === "ur" ? "Walaikum Assalam! Aap kaisay hain aaj?" : "Walaikum Assalam! How are you doing today?", lang);
-      }
-    }
-
-    if (App.awaitingWellbeingReply) {
-      App.awaitingWellbeingReply = false;
-      if (looksLikeRequest(text)) return routeCommand(text, lang, text);
-
-      App.conversation.push({ role: "user", content: text, lang });
-      const negative = /\b(not (good|well|great|fine)|bad|sad|tired|sick|unwell|terrible|stressed|upset|worried)\b|\b(theek nahi|thik nahi|bura|udaas|pareshan|bimar|thaka|thak)\b/i.test(text);
-      const reply = negative
-        ? (lang === "ur"
-            ? "Yeh sun kar afsos hua. Umeed hai jald behtar mehsoos karenge. Main aap ki kya madad kar sakta hoon?"
-            : "I'm sorry to hear that. I hope things get better soon. How can I help you today?")
-        : (lang === "ur"
-            ? "Sun kar acha laga! Bataiye, main aaj aap ki kya madad karoon? English practice, debate, ya kuch aur?"
-            : "Glad to hear that! How can I help you today? English practice, a debate, or something else?");
-      return speakReply(reply, lang);
-    }
-
-    return routeCommand(text, lang, text);
-  }
-
-  function looksLikeRequest(text) {
-    const t = text.trim().toLowerCase();
-    if (/^(how are you|and you|aap kaisay|aap kaise|tum kaise)/.test(t)) return false;
-    if (/\b(explain|teach|tell|give|show|open|start|help|correct|practice|practise|debate|interview|write|what|why|how|when|where|who|can you|could you|please|sikhao|batao|samjhao|kholo|kya|kaise|kyun)\b/.test(t)) return true;
-    return t.split(/\s+/).length > 9;
-  }
-
-  /* Intent check -> API-key check -> AI */
-  async function routeCommand(cmdText, lang, originalText) {
-    App.busy = true;
-    App.conversation.push({ role: "user", content: cmdText, lang });
-
-    const intent = matchIntent(cmdText);
+    const intent = matchIntent(text);
     if (intent) {
       if (intent.dynamic === "time") {
         const t = new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-        return speakReply(lang === "ur" ? `Abhi waqt hai ${t}.` : `The time is ${t}.`, lang);
+        speakReply(lang === "ur" ? `Abhi waqt hai ${t}.` : `The time is ${t}.`, lang, { flow: flow });
+        return;
       }
       if (intent.dynamic === "date") {
         const d = new Date().toLocaleDateString(undefined, { weekday: "long", year: "numeric", month: "long", day: "numeric" });
-        return speakReply(lang === "ur" ? `Aaj ki tareekh hai ${d}.` : `Today is ${d}.`, lang);
+        speakReply(lang === "ur" ? `Aaj ki tareekh hai ${d}.` : `Today is ${d}.`, lang, { flow: flow });
+        return;
       }
-      speakReply(lang === "ur" ? intent.ur : intent.en, lang, () => setTimeout(() => openSite(intent.url), 300));
+      speakReply(lang === "ur" ? intent.ur : intent.en, lang, {
+        flow: flow,
+        next: () => { openSite(intent.url); resumeListening(flow); },
+      });
       return;
     }
 
-    setOrb(State.THINKING, STATUS.PROCESSING);
-    Listener.pause();
-
-    const hint = grammarHint(originalText);
-    const prompt = hint ? `${cmdText}\n\n[Hidden coaching note, do not read aloud verbatim: ${hint}]` : cmdText;
-
-    try {
-      const result = await askAI(prompt, lang);
-
-      // API failsafe: no key stored anywhere
-      if (result.missingKey) {
-        Glass.sys(STATUS.NO_KEY);
-        setOrb(State.THINKING, STATUS.NO_KEY);
-        const spoken = lang === "ur"
-          ? "API key nahi mili. Settings mein gear icon dabaa kar key add karein."
-          : "API key missing. Please tap the settings gear and add a key.";
-        speakReply(spoken, lang, () => setStatus(STATUS.NO_KEY));
-        return;
-      }
-      speakReply(result.text, lang);
-    } catch (e) {
-      console.error("askAI crashed", e);
-      speakReply(Offline.respond(cmdText, lang), lang);
+    if (!navigator.onLine) {
+      speakReply(Offline.respond(text, lang), lang, { flow: flow });
+      return;
     }
+
+    // API failsafe: check localStorage BEFORE any request is fired
+    if (!Store.hasAnyKey()) {
+      App.keyMissing = true;
+      System.set(MSG.NO_KEY, "warn");
+      speakReply(lang === "ur" ? MSG.NO_KEY_SPOKEN_UR : MSG.NO_KEY_SPOKEN, lang, {
+        flow: flow,
+        remember: false,
+        next: () => goIdle(MSG.NO_KEY, "warn"),
+      });
+      return;
+    }
+    App.keyMissing = false;
+
+    const hint = grammarHint(text);
+    const prompt = hint ? `${text}\n\n[Hidden coaching note, do not read aloud verbatim: ${hint}]` : text;
+
+    const pending = askAI(prompt, lang, history, flow);   // starts now, in parallel with the capture hold
+    await sleep(CFG.CAPTURE_HOLD_MS);                     // keep "Captured: ..." readable
+    if (flow !== App.flow) return;
+    View.orb(State.THINKING);
+    System.set(MSG.THINKING);
+
+    const result = await pending;
+    if (flow !== App.flow || !result) return;
+    speakReply(result.text, lang, { flow: flow });
   }
 
   /* ============================================================
      ORB TAP  ->  unlock audio + start / interrupt / stop
      ============================================================ */
-  function activateVoiceMode() {
-    // 1) unlock TTS synchronously inside the gesture
+  function activate() {
+    if (App.active || App.starting) return;
+
+    // 1) unlock speech synthesis synchronously, inside the tap gesture
     TTS.unlock();
     App.audioUnlocked = true;
 
-    App.voiceMode = true;
-    App.awake = false;
-    App.busy = false;
-    Listener.permissionDenied = false;
-    Listener.paused = false;
-    Listener.langIndex = 0;
-    Listener.emptySessions = 0;
-    Glass.newTurn();
+    Listener.fatal = false;
+    App.active = true;
+    App.starting = true;
+    const flow = ++App.flow;
+    refreshKeyState();
+    Glass.clearTurn();
+    System.detail("");
 
-    if (!Listener.supported) {
-      setOrb(State.DORMANT, "Voice recognition not supported here");
-      Glass.sys("This WebView has no speech recognition. Use Chrome, or an Android WebView with microphone permission granted.");
-      return;
-    }
+    if (!Listener.supported) { goIdle(MSG.NO_SR, "error"); return; }
 
-    if (!Store.hasAnyKey()) Glass.sys(STATUS.NO_KEY);
-    else Glass.sys('Audio unlocked. Say "Hello Jarvis" to begin.');
+    View.orb(State.LISTENING);
+    System.set(MSG.STARTING);
 
-    setOrb(State.LISTENING, STATUS.UNLOCKED, 1800);
-    Listener.start();
-    setTimeout(() => {
-      if (App.voiceMode && App.state === State.LISTENING && Date.now() >= statusLockUntil) setStatus(STATUS.MIC);
-    }, 1900);
+    // 2) ask for the mic permission and release it immediately, then start the first pulse
+    Mic.preflight().then((res) => {
+      if (flow !== App.flow || !App.active) return;
+      App.starting = false;
+      if (!res.ok) System.detail(`Mic permission check failed (${res.name}). Trying the recognizer anyway...`);
+      setTimeout(() => { if (flow === App.flow && App.active) Listener.beginTurn(); }, 300);
+    });
   }
 
-  function deactivateVoiceMode() {
-    App.voiceMode = false;
-    App.awake = false;
-    App.busy = false;
-    App.awaitingSalamReply = false;
-    App.awaitingWellbeingReply = false;
+  function interrupt() {
+    App.flow++;
     TTS.stop();
-    Listener.stop();
-    Listener.paused = false;
-    setOrb(State.DORMANT);
+    Listener.stopAll();
+    Listener.beginTurn();
   }
 
   el.orbWrap.addEventListener("click", () => {
-    if (!App.voiceMode) {
-      activateVoiceMode();
-    } else if (App.state === State.SPEAKING || App.state === State.THINKING) {
-      // Tap while JARVIS talks = interrupt and listen again
+    if (App.starting) return;
+    if (!App.active) { activate(); return; }
+    if (App.state === State.LISTENING) { goIdle(MSG.IDLE_HINT); return; }   // tap while listening = stop
+    interrupt();                                                            // tap while thinking/speaking = interrupt
+  });
+
+  /* Release the mic whenever the app leaves the foreground. */
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") {
+      Listener.stopAll();
       TTS.stop();
-      App.busy = false;
-      Listener.paused = false;
-      Listener.resume();
-    } else {
-      deactivateVoiceMode();
+      if (App.active) goIdle(MSG.IDLE_HINT);
     }
   });
 
-  document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && App.voiceMode) {
-      if (TTS.supported && window.speechSynthesis.paused) window.speechSynthesis.resume();
-      if (!Listener.paused && !App.busy) Listener.start();
+  /* Watchdog: the UI can never sit on THINKING / SPEAKING forever. */
+  setInterval(() => {
+    if (App.active && (App.state === State.THINKING || App.state === State.SPEAKING) &&
+        Date.now() - App.stateSince > CFG.STUCK_MS) {
+      console.warn("[JARVIS] stuck state detected - recovering");
+      App.flow++;
+      TTS.stop();
+      Listener.beginTurn();
+      System.detail("Recovered from a stalled reply.");
     }
-  });
+  }, 5000);
 
   /* ============================================================
      SETTINGS MODAL
      ============================================================ */
   el.settingsBtn.addEventListener("click", () => {
-    Store.hasAnyKey(); // refresh App.apiKeys from storage
+    if (App.active) goIdle(MSG.IDLE_HINT);      // release the mic while the keyboard is up
+    Listener.stopAll();
+    Store.hasAnyKey();
     el.key_gemini.value = App.apiKeys.gemini || "";
     el.key_groq.value = App.apiKeys.groq || "";
     el.key_openrouter.value = App.apiKeys.openrouter || "";
@@ -1185,14 +1329,15 @@
     providerCursor = 0;
     Store.save();
     el.settingsModal.classList.remove("show");
-    Glass.sys(Store.hasAnyKey() ? "Settings saved." : STATUS.NO_KEY);
-    if (App.voiceMode && Store.hasAnyKey() && App.state === State.LISTENING) setStatus(STATUS.MIC);
+    refreshKeyState();
+    System.set(App.keyMissing ? MSG.NO_KEY : MSG.IDLE_HINT, App.keyMissing ? "warn" : "info");
   });
 
   el.clearKeysBtn.addEventListener("click", () => {
     Store.clearKeys();
     ["gemini", "groq", "openrouter", "together", "cohere"].forEach((k) => { el["key_" + k].value = ""; });
-    Glass.sys(STATUS.NO_KEY);
+    refreshKeyState();
+    System.set(MSG.NO_KEY, "warn");
   });
 
   /* ============================================================
@@ -1201,9 +1346,13 @@
   function init() {
     Store.load();
     setNetStatus();
-    setOrb(State.DORMANT);
-    if (!TTS.supported) Glass.sys("Speech synthesis is not supported on this device.");
-    if (!Store.hasAnyKey()) Glass.sys(STATUS.NO_KEY);
+    View.orb(State.DORMANT);
+    refreshKeyState();
+    System.set(MSG.IDLE_HINT);
+    if (!TTS.supported) System.detail(MSG.NO_TTS);
+    if (!Listener.supported) System.detail(MSG.NO_SR);
   }
-  document.addEventListener("DOMContentLoaded", init);
+
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
+  else init();
 })();
