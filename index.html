@@ -1,346 +1,926 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
-<title>JARVIS — Created by IZHAR AFRIDI</title>
-<meta name="theme-color" content="#010308">
-<meta name="mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<style>
-  :root{
-    --bg:#010308;
-    --neon:#00f3ff;
-    --neon-dim:#009aa8;
-    --neon-glow: rgba(0,243,255,0.55);
-    --danger:#ff2e63;
-    --ok:#00ffa2;
-    --warn:#ffb020;
-  }
-  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent; -webkit-user-select:none; user-select:none;}
-  html,body{
-    margin:0; padding:0; height:100%; width:100%;
-    background:var(--bg);
-    color:#d8fbff;
-    font-family:'Segoe UI', Roboto, Arial, sans-serif;
-    overflow:hidden;
-    touch-action:manipulation;
-  }
-  body::before{
-    content:"";
-    position:fixed; inset:0;
-    background:
-      radial-gradient(circle at 50% 40%, rgba(0,243,255,0.09), transparent 45%),
-      repeating-linear-gradient(0deg, rgba(0,243,255,0.025) 0px, rgba(0,243,255,0.025) 1px, transparent 1px, transparent 3px);
-    pointer-events:none;
-    z-index:0;
-  }
-  #app{
-    position:relative; z-index:1;
-    display:flex; flex-direction:column;
-    height:100%; width:100%;
-    max-width:520px; margin:0 auto;
-    padding:calc(14px + env(safe-area-inset-top)) 14px calc(12px + env(safe-area-inset-bottom));
-  }
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#010308">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>JARVIS AI • Neural HUD Voice Assistant</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
+  
+  <style>
+    :root {
+      --bg-dark: #010308;
+      --bg-card: rgba(3, 14, 28, 0.78);
+      --cyan-neon: #00f3ff;
+      --cyan-glow: rgba(0, 243, 255, 0.45);
+      --electric-blue: #0088ff;
+      --teal-accent: #00ffd5;
+      --amber-warn: #ffaa00;
+      --red-alert: #ff0055;
+      --text-main: #e6f8ff;
+      --text-muted: #628ea6;
+      --border-hud: rgba(0, 243, 255, 0.28);
+      --hud-font: 'Share Tech Mono', monospace;
+      --title-font: 'Orbitron', sans-serif;
+      --body-font: 'Rajdhani', sans-serif;
+    }
 
-  /* ============ HEADER ============ */
-  header{
-    display:flex; justify-content:space-between; align-items:center;
-    padding:4px 2px 12px;
-    border-bottom:1px solid rgba(0,243,255,0.15);
-    flex:0 0 auto;
-  }
-  .brand{ display:flex; flex-direction:column; line-height:1.15; min-width:0; }
-  .brand .title{
-    font-size:19px; font-weight:800; letter-spacing:3px;
-    color:var(--neon);
-    text-shadow:0 0 8px var(--neon-glow), 0 0 20px var(--neon-glow);
-  }
-  .brand .sub{
-    font-size:9.5px; letter-spacing:1.5px; color:#5fd8e6; opacity:0.85; margin-top:3px;
-    white-space:nowrap;
-  }
-  .header-right{ display:flex; gap:8px; align-items:center; flex:0 0 auto; }
-  .status-pill{
-    font-size:10px; padding:5px 10px; border-radius:20px;
-    border:1px solid var(--neon-dim); color:var(--neon);
-    background:rgba(0,243,255,0.06);
-    display:flex; align-items:center; gap:6px;
-    white-space:nowrap; letter-spacing:1px;
-  }
-  .status-pill .dot{
-    width:7px; height:7px; border-radius:50%;
-    background:var(--danger); box-shadow:0 0 6px var(--danger);
-  }
-  .status-pill.online .dot{ background:var(--ok); box-shadow:0 0 6px var(--ok); }
-  .icon-btn{
-    width:34px; height:34px; border-radius:10px;
-    border:1px solid rgba(0,243,255,0.3);
-    background:rgba(0,243,255,0.05);
-    color:var(--neon); font-size:16px;
-    display:flex; align-items:center; justify-content:center;
-    cursor:pointer;
-  }
-  .icon-btn:active{ background:rgba(0,243,255,0.2); }
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
 
-  /* ============ CENTER STAGE ============ */
-  .stage{
-    flex:1 1 auto;
-    display:flex; flex-direction:column; align-items:center; justify-content:center;
-    min-height:0;
-    padding:8px 0;
-  }
-  .orb-wrap{
-    position:relative; width:220px; height:220px;
-    display:flex; align-items:center; justify-content:center;
-    cursor:pointer;
-  }
-  .orb-ring{
-    position:absolute; inset:0; border-radius:50%;
-    border:1px solid rgba(0,243,255,0.25);
-  }
-  .orb-ring.r2{ inset:-20px; border-color:rgba(0,243,255,0.12); }
-  .orb-ring.r3{ inset:-42px; border-color:rgba(0,243,255,0.06); }
-  .orb-wrap.active .orb-ring.r1{ animation:ringSpin 12s linear infinite; border-style:dashed; }
-  @keyframes ringSpin{ to{ transform:rotate(360deg); } }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background-color: var(--bg-dark);
+      background-image: 
+        radial-gradient(circle at 50% 45%, rgba(0, 80, 140, 0.18) 0%, transparent 65%),
+        linear-gradient(rgba(0, 243, 255, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 243, 255, 0.03) 1px, transparent 1px);
+      background-size: 100% 100%, 32px 32px, 32px 32px;
+      color: var(--text-main);
+      font-family: var(--body-font);
+    }
 
-  .orb{
-    width:165px; height:165px; border-radius:50%;
-    position:relative;
-    background:
-      radial-gradient(circle at 35% 30%, rgba(180,255,255,0.9), rgba(0,243,255,0.55) 40%, rgba(0,60,70,0.4) 70%, rgba(0,10,15,0.2) 100%);
-    box-shadow:
-      0 0 30px 6px var(--neon-glow),
-      inset 0 0 30px rgba(0,243,255,0.5);
-    opacity:0.45;
-    transition:opacity 0.4s ease, box-shadow 0.4s ease;
-  }
-  .orb::after{
-    content:"";
-    position:absolute; inset:12%;
-    border-radius:50%;
-    background:radial-gradient(circle at 40% 35%, rgba(255,255,255,0.9), rgba(0,243,255,0.2) 60%, transparent 75%);
-    mix-blend-mode:screen;
-  }
+    /* Subtle CRT Scanline overlay */
+    .scanlines {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: linear-gradient(rgba(18, 16, 16, 0) 50%, rgba(0, 0, 0, 0.25) 50%);
+      background-size: 100% 4px;
+      z-index: 10;
+      pointer-events: none;
+      opacity: 0.6;
+    }
 
-  /* Dormant / idle */
-  .orb.dormant{ opacity:0.35; animation:dormantBreathe 4s ease-in-out infinite; }
-  @keyframes dormantBreathe{
-    0%,100%{ transform:scale(0.97); }
-    50%{ transform:scale(1.02); }
-  }
-  /* Listening */
-  .orb.listening{
-    opacity:0.95;
-    animation:listenPulse 1.1s ease-in-out infinite;
-    box-shadow:0 0 45px 12px rgba(0,243,255,0.75), inset 0 0 35px rgba(0,243,255,0.7);
-  }
-  @keyframes listenPulse{
-    0%,100%{ transform:scale(1); }
-    50%{ transform:scale(1.12); }
-  }
-  /* Thinking */
-  .orb.thinking{
-    opacity:0.9;
-    animation:thinkSpin 1.8s linear infinite;
-  }
-  @keyframes thinkSpin{
-    0%{ filter:hue-rotate(0deg) brightness(1); box-shadow:0 0 30px 8px var(--neon-glow), inset 0 0 25px rgba(0,243,255,0.5);}
-    50%{ filter:hue-rotate(140deg) brightness(1.3); box-shadow:0 0 50px 14px rgba(0,243,255,0.9), inset 0 0 35px rgba(0,243,255,0.8);}
-    100%{ filter:hue-rotate(360deg) brightness(1); box-shadow:0 0 30px 8px var(--neon-glow), inset 0 0 25px rgba(0,243,255,0.5);}
-  }
-  /* Speaking */
-  .orb.speaking{
-    opacity:1;
-    animation:speakPulse 0.35s ease-in-out infinite alternate;
-    box-shadow:0 0 60px 18px rgba(0,243,255,0.95), inset 0 0 40px rgba(255,255,255,0.6);
-  }
-  @keyframes speakPulse{
-    0%{ transform:scale(1); }
-    100%{ transform:scale(1.07); }
-  }
+    /* Main Container */
+    #hud-container {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: space-between;
+      padding: env(safe-area-inset-top, 16px) 16px env(safe-area-inset-bottom, 16px) 16px;
+      z-index: 20;
+    }
 
-  .status-line{
-    margin-top:26px; font-size:12.5px; letter-spacing:3px; text-transform:uppercase;
-    color:var(--neon); opacity:0.9; text-align:center; min-height:18px;
-    text-shadow:0 0 8px var(--neon-glow);
-    padding:0 10px;
-  }
-  .status-line.flash{ animation:flashIn 0.5s ease; }
-  @keyframes flashIn{
-    0%{ opacity:0; transform:translateY(4px); }
-    100%{ opacity:0.9; transform:translateY(0); }
-  }
+    /* Top HUD Navigation Bar */
+    .top-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 14px;
+      background: rgba(1, 8, 18, 0.65);
+      border: 1px solid var(--border-hud);
+      border-radius: 12px;
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      box-shadow: 0 0 20px rgba(0, 243, 255, 0.08);
+      position: relative;
+      margin-top: 4px;
+    }
 
-  /* ============ GLASS OUTPUT OVERLAY ============ */
-  .glass{
-    flex:0 0 auto;
-    min-height:112px; max-height:34vh;
-    margin-top:6px;
-    padding:12px 14px;
-    border-radius:18px;
-    background:linear-gradient(145deg, rgba(0,243,255,0.10), rgba(0,30,40,0.35));
-    border:1px solid rgba(0,243,255,0.28);
-    box-shadow:0 8px 32px rgba(0,0,0,0.5), inset 0 0 20px rgba(0,243,255,0.06);
-    -webkit-backdrop-filter:blur(14px);
-    backdrop-filter:blur(14px);
-    overflow-y:auto;
-    scrollbar-width:thin;
-    -webkit-user-select:text; user-select:text;
-  }
-  .glass::-webkit-scrollbar{ width:3px; }
-  .glass::-webkit-scrollbar-thumb{ background:rgba(0,243,255,0.35); border-radius:4px; }
-  .g-row{ margin-bottom:10px; }
-  .g-row:last-child{ margin-bottom:0; }
-  .g-tag{
-    display:block; font-size:9px; letter-spacing:2px; margin-bottom:3px;
-    color:var(--neon-dim); text-transform:uppercase;
-  }
-  .g-text{
-    font-size:14.5px; line-height:1.5; color:#dffcff;
-    white-space:pre-wrap; word-wrap:break-word;
-  }
-  .g-row.you .g-text{ color:#9fe9f0; font-style:italic; }
-  .g-row.you.interim .g-text{ opacity:0.6; }
-  .g-row.sys .g-text{ color:#ffd27f; font-size:12px; }
-  .g-empty{
-    font-size:12.5px; color:#5fb8c2; opacity:0.75; text-align:center; line-height:1.6;
-    padding:14px 6px;
-  }
+    .top-bar::before {
+      content: '';
+      position: absolute;
+      top: -1px; left: 20px; width: 40px; height: 2px;
+      background: var(--cyan-neon);
+      box-shadow: 0 0 8px var(--cyan-neon);
+    }
 
-  /* ============ SETTINGS MODAL ============ */
-  .modal-overlay{
-    position:fixed; inset:0; background:rgba(0,4,8,0.85);
-    display:none; align-items:center; justify-content:center;
-    z-index:50; padding:20px;
-    -webkit-backdrop-filter:blur(4px); backdrop-filter:blur(4px);
-  }
-  .modal-overlay.show{ display:flex; }
-  .modal{
-    width:100%; max-width:460px; max-height:88vh; overflow-y:auto;
-    background:#02141a; border:1px solid rgba(0,243,255,0.35);
-    border-radius:16px; padding:20px;
-    box-shadow:0 0 40px rgba(0,243,255,0.2);
-    -webkit-user-select:text; user-select:text;
-  }
-  .modal h2{ margin:0 0 4px; color:var(--neon); font-size:17px; letter-spacing:1.5px; }
-  .modal .modal-sub{ font-size:11px; color:#7fdfe9; opacity:0.7; margin-bottom:16px; line-height:1.5; }
-  .field{ margin-bottom:13px; }
-  .field label{
-    display:flex; justify-content:space-between; align-items:center;
-    font-size:12px; color:#9fe9f0; margin-bottom:6px; letter-spacing:0.5px;
-  }
-  .field label .badge{
-    font-size:9px; padding:2px 7px; border-radius:10px;
-    border:1px solid rgba(0,243,255,0.3); color:var(--neon);
-  }
-  .field input, .field select{
-    width:100%; background:rgba(0,243,255,0.06);
-    border:1px solid rgba(0,243,255,0.25);
-    color:#eafffe; padding:10px 11px; border-radius:10px;
-    font-size:13px; outline:none;
-  }
-  .field select option{ background:#02141a; color:#eafffe; }
-  .field input:focus, .field select:focus{ border-color:var(--neon); }
-  .modal-actions{ display:flex; gap:10px; margin-top:18px; }
-  .btn{
-    flex:1; padding:11px; border-radius:10px; border:1px solid var(--neon-dim);
-    background:rgba(0,243,255,0.12); color:var(--neon); font-size:13px; font-weight:600;
-    cursor:pointer; letter-spacing:0.5px;
-  }
-  .btn.secondary{ background:transparent; color:#9fe9f0; border-color:rgba(255,255,255,0.15); }
-  .note{ font-size:10.5px; color:#6fdcb0; opacity:0.7; margin-top:10px; line-height:1.5; }
+    .system-brand {
+      display: flex;
+      flex-direction: column;
+    }
 
-  @media (max-height:640px){
-    .orb-wrap{ width:160px; height:160px; }
-    .orb{ width:120px; height:120px; }
-    .status-line{ margin-top:16px; }
-    .glass{ min-height:90px; }
-  }
-</style>
+    .system-title {
+      font-family: var(--title-font);
+      font-size: 1.15rem;
+      font-weight: 900;
+      letter-spacing: 2px;
+      color: var(--cyan-neon);
+      text-shadow: 0 0 10px var(--cyan-glow);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .system-creator {
+      font-family: var(--hud-font);
+      font-size: 0.65rem;
+      letter-spacing: 1.5px;
+      color: var(--teal-accent);
+      text-transform: uppercase;
+      opacity: 0.85;
+    }
+
+    .hud-controls {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    /* Connection status badge */
+    .conn-badge {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 10px;
+      border-radius: 20px;
+      background: rgba(0, 243, 255, 0.06);
+      border: 1px solid rgba(0, 243, 255, 0.2);
+      font-family: var(--hud-font);
+      font-size: 0.72rem;
+      letter-spacing: 1px;
+    }
+
+    .conn-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: var(--teal-accent);
+      box-shadow: 0 0 8px var(--teal-accent);
+      animation: pulse-dot 1.8s infinite ease-in-out;
+    }
+
+    .conn-dot.offline {
+      background: var(--red-alert);
+      box-shadow: 0 0 8px var(--red-alert);
+      animation: none;
+    }
+
+    .conn-dot.warn {
+      background: var(--amber-warn);
+      box-shadow: 0 0 8px var(--amber-warn);
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { transform: scale(1); opacity: 1; }
+      50% { transform: scale(1.4); opacity: 0.4; }
+    }
+
+    .icon-btn {
+      background: rgba(0, 243, 255, 0.08);
+      border: 1px solid var(--border-hud);
+      color: var(--cyan-neon);
+      width: 38px;
+      height: 38px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 1.1rem;
+      cursor: pointer;
+      transition: all 0.25s ease;
+      box-shadow: 0 0 10px rgba(0, 243, 255, 0.1);
+    }
+
+    .icon-btn:active {
+      transform: scale(0.92);
+      background: rgba(0, 243, 255, 0.25);
+    }
+
+    /* Center Visualizer Area */
+    .visualizer-stage {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      cursor: pointer;
+    }
+
+    /* Futuristic HUD Rings around Orb */
+    .hud-ring-wrapper {
+      position: relative;
+      width: 280px;
+      height: 280px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .hud-svg-ring {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+
+    .ring-outer {
+      animation: spin-clockwise 24s linear infinite;
+      transform-origin: center;
+    }
+
+    .ring-inner {
+      animation: spin-counter 16s linear infinite;
+      transform-origin: center;
+    }
+
+    .ring-fast {
+      animation: spin-clockwise 7s linear infinite;
+      transform-origin: center;
+    }
+
+    @keyframes spin-clockwise {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    @keyframes spin-counter {
+      from { transform: rotate(360deg); }
+      to { transform: rotate(0deg); }
+    }
+
+    /* Central Glowing Orb */
+    .jarvis-orb {
+      width: 150px;
+      height: 150px;
+      border-radius: 50%;
+      position: relative;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.5s cubic-bezier(0.19, 1, 0.22, 1);
+      z-index: 5;
+    }
+
+    .orb-core {
+      width: 90px;
+      height: 90px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 35% 35%, #ffffff 0%, #00f3ff 45%, #004488 80%, #010814 100%);
+      position: relative;
+      z-index: 6;
+      box-shadow: inset 0 0 15px #ffffff, 0 0 35px var(--cyan-glow);
+    }
+
+    .orb-halo {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      background: radial-gradient(circle, rgba(0, 243, 255, 0.4) 0%, rgba(0, 136, 255, 0.15) 50%, transparent 75%);
+      filter: blur(8px);
+      z-index: 4;
+    }
+
+    .sonar-wave {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      border-radius: 50%;
+      border: 1.5px solid var(--cyan-neon);
+      opacity: 0;
+      z-index: 3;
+    }
+
+    /* 4 Visualizer States */
+
+    /* 1. DORMANT STATE: Low glow, gentle breathing */
+    .jarvis-orb.state-dormant .orb-core {
+      box-shadow: inset 0 0 10px #70e4ff, 0 0 25px rgba(0, 243, 255, 0.25);
+      animation: dormant-breathe 4.5s infinite ease-in-out;
+      background: radial-gradient(circle at 40% 40%, #c4f4ff 0%, #00a6c0 50%, #002c4f 90%);
+    }
+
+    @keyframes dormant-breathe {
+      0%, 100% { transform: scale(0.95); opacity: 0.75; }
+      50% { transform: scale(1.02); opacity: 0.95; }
+    }
+
+    /* 2. LISTENING STATE: Pulsing Cyan Animation with Sonar Wave */
+    .jarvis-orb.state-listening .orb-core {
+      box-shadow: inset 0 0 20px #ffffff, 0 0 50px var(--cyan-neon), 0 0 90px rgba(0, 243, 255, 0.6);
+      animation: listening-pulse 1.3s infinite ease-in-out;
+      background: radial-gradient(circle at 35% 35%, #ffffff 0%, #00f3ff 50%, #0055aa 85%);
+    }
+
+    .jarvis-orb.state-listening .sonar-wave {
+      animation: sonar-expand 1.5s infinite cubic-bezier(0.215, 0.61, 0.355, 1);
+    }
+
+    @keyframes listening-pulse {
+      0%, 100% { transform: scale(1.0); }
+      50% { transform: scale(1.12); }
+    }
+
+    @keyframes sonar-expand {
+      0% { transform: scale(0.85); opacity: 0.9; }
+      100% { transform: scale(1.85); opacity: 0; }
+    }
+
+    /* 3. THINKING STATE: Rotating Hue/Glow with Fast Gyro */
+    .jarvis-orb.state-thinking .orb-core {
+      animation: thinking-hue 2.2s infinite linear, thinking-spin 1.8s infinite ease-in-out;
+      box-shadow: inset 0 0 25px #ffffff, 0 0 60px #0088ff, 0 0 100px #aa00ff;
+    }
+
+    @keyframes thinking-hue {
+      0% { filter: hue-rotate(0deg); }
+      50% { filter: hue-rotate(180deg); }
+      100% { filter: hue-rotate(360deg); }
+    }
+
+    @keyframes thinking-spin {
+      0%, 100% { transform: scale(1.05) rotate(0deg); }
+      50% { transform: scale(0.95) rotate(180deg); }
+    }
+
+    /* 4. SPEAKING STATE: High-Intensity Neon Aura & Audio Vibration */
+    .jarvis-orb.state-speaking .orb-core {
+      box-shadow: inset 0 0 30px #ffffff, 0 0 60px var(--cyan-neon), 0 0 120px #00ffd5, 0 0 160px rgba(0, 243, 255, 0.8);
+      animation: speaking-vibrate 0.28s infinite alternate ease-in-out;
+      background: radial-gradient(circle at 30% 30%, #ffffff 10%, #00ffd5 40%, #0066cc 80%);
+    }
+
+    .jarvis-orb.state-speaking .sonar-wave {
+      animation: sonar-expand 0.65s infinite ease-out;
+    }
+
+    @keyframes speaking-vibrate {
+      0% { transform: scale(1.12); filter: brightness(1.2); }
+      100% { transform: scale(1.28); filter: brightness(1.5); }
+    }
+
+    /* HUD Subtitle State label below Orb */
+    .orb-status-text {
+      margin-top: 18px;
+      font-family: var(--hud-font);
+      font-size: 0.85rem;
+      letter-spacing: 2px;
+      color: var(--cyan-neon);
+      text-shadow: 0 0 8px var(--cyan-glow);
+      text-transform: uppercase;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .orb-hint {
+      margin-top: 6px;
+      font-family: var(--hud-font);
+      font-size: 0.68rem;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+    }
+
+    /* Status Display: Single glassmorphism overlay box at the bottom */
+    .status-display-card {
+      width: 100%;
+      background: var(--bg-card);
+      border: 1px solid var(--border-hud);
+      border-radius: 18px;
+      padding: 16px 18px;
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(0, 243, 255, 0.2);
+      position: relative;
+      overflow: hidden;
+      margin-bottom: 6px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      max-height: 220px;
+    }
+
+    /* Corner cyber accents */
+    .status-display-card::after {
+      content: '';
+      position: absolute;
+      bottom: 0; right: 0; width: 14px; height: 14px;
+      border-bottom: 2px solid var(--cyan-neon);
+      border-right: 2px solid var(--cyan-neon);
+    }
+
+    .transcript-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--hud-font);
+      font-size: 0.7rem;
+      letter-spacing: 1.5px;
+      color: var(--teal-accent);
+      text-transform: uppercase;
+    }
+
+    .transcript-live-container {
+      font-size: 0.95rem;
+      color: var(--cyan-neon);
+      font-weight: 600;
+      min-height: 22px;
+      line-height: 1.35;
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+    }
+
+    .transcript-prefix {
+      font-family: var(--hud-font);
+      font-size: 0.72rem;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      flex-shrink: 0;
+    }
+
+    .transcript-text {
+      word-break: break-word;
+      transition: color 0.2s;
+    }
+
+    .transcript-text.empty {
+      color: var(--text-muted);
+      font-style: italic;
+      font-weight: 400;
+    }
+
+    .response-divider {
+      height: 1px;
+      background: linear-gradient(90deg, rgba(0, 243, 255, 0.3) 0%, transparent 100%);
+    }
+
+    .response-container {
+      font-size: 1.02rem;
+      line-height: 1.45;
+      color: var(--text-main);
+      overflow-y: auto;
+      max-height: 110px;
+      padding-right: 4px;
+      word-break: break-word;
+      font-weight: 500;
+    }
+
+    .response-container::-webkit-scrollbar {
+      width: 3px;
+    }
+    .response-container::-webkit-scrollbar-thumb {
+      background: var(--border-hud);
+      border-radius: 4px;
+    }
+
+    .hud-meta-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-family: var(--hud-font);
+      font-size: 0.65rem;
+      color: var(--text-muted);
+      letter-spacing: 1px;
+      padding-top: 4px;
+      border-top: 1px dashed rgba(0, 243, 255, 0.15);
+    }
+
+    /* Settings Modal Overlay */
+    .modal-backdrop {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(1, 4, 10, 0.88);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      z-index: 100;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 16px;
+    }
+
+    .modal-backdrop.active {
+      display: flex;
+    }
+
+    .settings-panel {
+      width: 100%;
+      max-width: 480px;
+      max-height: 90vh;
+      background: #030b17;
+      border: 1px solid var(--cyan-neon);
+      box-shadow: 0 0 35px rgba(0, 243, 255, 0.25);
+      border-radius: 16px;
+      overflow-y: auto;
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      position: relative;
+    }
+
+    .settings-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-hud);
+      padding-bottom: 12px;
+    }
+
+    .settings-title {
+      font-family: var(--title-font);
+      font-size: 1.15rem;
+      color: var(--cyan-neon);
+      letter-spacing: 1.5px;
+    }
+
+    .close-btn {
+      background: transparent;
+      border: none;
+      color: var(--text-muted);
+      font-size: 1.4rem;
+      cursor: pointer;
+      line-height: 1;
+    }
+
+    .close-btn:hover {
+      color: var(--cyan-neon);
+    }
+
+    .settings-section-title {
+      font-family: var(--hud-font);
+      font-size: 0.78rem;
+      letter-spacing: 1.5px;
+      color: var(--teal-accent);
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .key-group {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+      margin-bottom: 10px;
+    }
+
+    .key-label {
+      font-family: var(--hud-font);
+      font-size: 0.72rem;
+      color: var(--text-main);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .key-status-indicator {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+    }
+
+    .key-input {
+      background: rgba(0, 243, 255, 0.05);
+      border: 1px solid var(--border-hud);
+      border-radius: 8px;
+      color: var(--cyan-neon);
+      font-family: var(--hud-font);
+      font-size: 0.85rem;
+      padding: 10px 12px;
+      outline: none;
+      transition: border-color 0.2s;
+      width: 100%;
+    }
+
+    .key-input:focus {
+      border-color: var(--cyan-neon);
+      box-shadow: 0 0 10px rgba(0, 243, 255, 0.2);
+    }
+
+    .select-input {
+      background: #041226;
+      border: 1px solid var(--border-hud);
+      border-radius: 8px;
+      color: var(--cyan-neon);
+      font-family: var(--hud-font);
+      font-size: 0.85rem;
+      padding: 10px 12px;
+      outline: none;
+      width: 100%;
+    }
+
+    .btn-row {
+      display: flex;
+      gap: 10px;
+      margin-top: 10px;
+    }
+
+    .primary-btn {
+      flex: 1;
+      background: linear-gradient(135deg, rgba(0, 243, 255, 0.2) 0%, rgba(0, 136, 255, 0.3) 100%);
+      border: 1px solid var(--cyan-neon);
+      border-radius: 8px;
+      color: #ffffff;
+      font-family: var(--title-font);
+      font-size: 0.85rem;
+      font-weight: 700;
+      letter-spacing: 1.5px;
+      padding: 12px;
+      cursor: pointer;
+      text-transform: uppercase;
+      box-shadow: 0 0 15px rgba(0, 243, 255, 0.2);
+      transition: all 0.2s;
+    }
+
+    .primary-btn:active {
+      transform: scale(0.98);
+      background: var(--cyan-neon);
+      color: var(--bg-dark);
+    }
+
+    .secondary-btn {
+      background: transparent;
+      border: 1px solid var(--text-muted);
+      border-radius: 8px;
+      color: var(--text-muted);
+      font-family: var(--hud-font);
+      font-size: 0.8rem;
+      padding: 12px 14px;
+      cursor: pointer;
+    }
+
+    .badge-tag {
+      background: rgba(0, 243, 255, 0.15);
+      color: var(--cyan-neon);
+      font-size: 0.65rem;
+      padding: 2px 6px;
+      border-radius: 4px;
+      letter-spacing: 0.5px;
+    }
+
+    /* Toast Notification */
+    #hud-toast {
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(-100px);
+      background: rgba(3, 16, 32, 0.95);
+      border: 1px solid var(--cyan-neon);
+      color: var(--cyan-neon);
+      font-family: var(--hud-font);
+      font-size: 0.85rem;
+      padding: 10px 20px;
+      border-radius: 30px;
+      box-shadow: 0 0 20px rgba(0, 243, 255, 0.4);
+      z-index: 200;
+      transition: transform 0.35s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      pointer-events: none;
+      letter-spacing: 1px;
+    }
+
+    #hud-toast.show {
+      transform: translateX(-50%) translateY(0);
+    }
+
+    /* Wave visualizer line under status card */
+    .mini-audio-bar {
+      display: flex;
+      align-items: center;
+      gap: 3px;
+      height: 12px;
+    }
+
+    .bar-line {
+      width: 2px;
+      height: 4px;
+      background: var(--cyan-neon);
+      border-radius: 2px;
+      transition: height 0.1s ease;
+    }
+
+    .state-listening .bar-line {
+      animation: bar-dance 0.7s infinite alternate ease-in-out;
+    }
+    .state-speaking .bar-line {
+      animation: bar-dance-fast 0.35s infinite alternate ease-in-out;
+    }
+
+    .bar-line:nth-child(2) { animation-delay: 0.1s; }
+    .bar-line:nth-child(3) { animation-delay: 0.2s; }
+    .bar-line:nth-child(4) { animation-delay: 0.15s; }
+    .bar-line:nth-child(5) { animation-delay: 0.25s; }
+
+    @keyframes bar-dance {
+      0% { height: 3px; }
+      100% { height: 12px; }
+    }
+    @keyframes bar-dance-fast {
+      0% { height: 4px; }
+      100% { height: 16px; background: var(--teal-accent); }
+    }
+  </style>
 </head>
 <body>
-<div id="app">
+  <div class="scanlines"></div>
 
-  <header>
-    <div class="brand">
-      <div class="title">JARVIS</div>
-      <div class="sub">Created by IZHAR AFRIDI</div>
-    </div>
-    <div class="header-right">
-      <div class="status-pill" id="netStatus"><span class="dot"></span><span id="netStatusText">OFFLINE</span></div>
-      <div class="icon-btn" id="settingsBtn" title="API Settings" role="button" aria-label="API settings">⚙</div>
-    </div>
-  </header>
+  <div id="hud-container">
+    <!-- Top HUD Telemetry Bar -->
+    <header class="top-bar">
+      <div class="system-brand">
+        <div class="system-title">
+          <span>JARVIS</span>
+          <span style="font-size: 0.6rem; padding: 2px 5px; border: 1px solid var(--cyan-neon); border-radius: 4px;">AI HUD</span>
+        </div>
+        <div class="system-creator">CREATED BY IZHAR AFRIDI</div>
+      </div>
 
-  <main class="stage">
-    <div class="orb-wrap" id="orbWrap" role="button" aria-label="Tap to start voice mode">
-      <div class="orb-ring r3"></div>
-      <div class="orb-ring r2"></div>
-      <div class="orb-ring r1"></div>
-      <div class="orb dormant" id="orb"></div>
-    </div>
-    <div class="status-line" id="statusLine">Tap orb to start voice mode</div>
-  </main>
+      <div class="hud-controls">
+        <div class="conn-badge" id="conn-badge" title="Connection & Active Engine Status">
+          <span class="conn-dot" id="conn-dot"></span>
+          <span id="conn-text">ONLINE • GEMINI</span>
+        </div>
+        <button class="icon-btn" id="audio-toggle-btn" title="Mic On / Off">
+          <span id="mic-icon">🎙️</span>
+        </button>
+        <button class="icon-btn" id="settings-open-btn" title="Configure 5 API Engines & Preferences">
+          ⚙️
+        </button>
+      </div>
+    </header>
 
-  <section class="glass" id="glass" aria-live="polite">
-    <div class="g-empty" id="gEmpty">Your live transcript and JARVIS's replies will appear here.<br>Say <b>"Hello Jarvis"</b> after activating.</div>
-  </section>
-</div>
+    <!-- Center Futuristic Orb Visualizer -->
+    <main class="visualizer-stage" id="visualizer-stage" title="Tap anywhere to activate / speak">
+      <div class="hud-ring-wrapper">
+        <!-- SVG concentric HUD rings with tick marks -->
+        <svg class="hud-svg-ring ring-outer" viewBox="0 0 280 280">
+          <circle cx="140" cy="140" r="132" fill="none" stroke="rgba(0, 243, 255, 0.18)" stroke-width="1.5" stroke-dasharray="8 6" />
+          <circle cx="140" cy="140" r="124" fill="none" stroke="rgba(0, 136, 255, 0.22)" stroke-width="1" />
+          <path d="M 140 8 A 132 132 0 0 1 233 47" fill="none" stroke="#00f3ff" stroke-width="3" stroke-linecap="round" />
+          <path d="M 140 272 A 132 132 0 0 1 47 233" fill="none" stroke="#00ffd5" stroke-width="3" stroke-linecap="round" />
+        </svg>
 
-<!-- SETTINGS MODAL -->
-<div class="modal-overlay" id="settingsModal">
-  <div class="modal">
-    <h2>⚙ API CONFIGURATION</h2>
-    <div class="modal-sub">Keys are stored only on this device (LocalStorage). JARVIS tries them in order and auto-rotates on quota (429) or connection errors.</div>
+        <svg class="hud-svg-ring ring-inner" viewBox="0 0 280 280">
+          <circle cx="140" cy="140" r="105" fill="none" stroke="rgba(0, 243, 255, 0.25)" stroke-width="1" stroke-dasharray="16 12" />
+          <path d="M 40 140 A 100 100 0 0 1 140 40" fill="none" stroke="rgba(0, 243, 255, 0.45)" stroke-width="2" />
+        </svg>
 
-    <div class="field">
-      <label>1. Google Gemini API Key <span class="badge">Priority 1</span></label>
-      <input type="password" id="key_gemini" placeholder="AIza..." autocomplete="off">
-    </div>
-    <div class="field">
-      <label>2. Groq API Key (Llama 3.3 70B) <span class="badge">Priority 2</span></label>
-      <input type="password" id="key_groq" placeholder="gsk_..." autocomplete="off">
-    </div>
-    <div class="field">
-      <label>3. OpenRouter API Key <span class="badge">Priority 3</span></label>
-      <input type="password" id="key_openrouter" placeholder="sk-or-..." autocomplete="off">
-    </div>
-    <div class="field">
-      <label>4. Together AI API Key <span class="badge">Priority 4</span></label>
-      <input type="password" id="key_together" placeholder="Together key..." autocomplete="off">
-    </div>
-    <div class="field">
-      <label>5. Cohere API Key <span class="badge">Priority 5</span></label>
-      <input type="password" id="key_cohere" placeholder="Cohere key..." autocomplete="off">
-    </div>
+        <svg class="hud-svg-ring ring-fast" viewBox="0 0 280 280">
+          <circle cx="140" cy="140" r="88" fill="none" stroke="rgba(0, 255, 213, 0.2)" stroke-width="1" stroke-dasharray="4 8" />
+        </svg>
 
-    <div class="field">
-      <label>Voice Language</label>
-      <select id="voicePref">
-        <option value="auto">Auto-detect (Urdu / English)</option>
-        <option value="en">Always English voice</option>
-        <option value="ur">Always Urdu voice</option>
-      </select>
-    </div>
-    <div class="field">
-      <label>Speech Rate <span class="badge" id="rateBadge">1.0</span></label>
-      <input type="range" id="rateRange" min="0.7" max="1.3" step="0.05" value="1.0">
-    </div>
-    <div class="field">
-      <label>Voice Pitch <span class="badge" id="pitchBadge">1.0</span></label>
-      <input type="range" id="pitchRange" min="0.7" max="1.3" step="0.05" value="1.0">
-    </div>
+        <!-- Dynamic Animated Orb -->
+        <div class="jarvis-orb state-dormant" id="jarvis-orb">
+          <div class="sonar-wave"></div>
+          <div class="orb-halo"></div>
+          <div class="orb-core"></div>
+        </div>
+      </div>
 
-    <div class="note">Leave a key blank to skip that provider. If every engine fails, JARVIS falls back to offline mode automatically.</div>
+      <!-- State labels -->
+      <div class="orb-status-text" id="orb-status-text">
+        <span style="color: var(--teal-accent);">●</span>
+        <span id="status-label">INITIALIZING SYSTEMS</span>
+      </div>
+      <div class="orb-hint" id="orb-hint">TAP SCREEN TO UNLOCK AUDIO • SAY "HEY JARVIS"</div>
+    </main>
 
-    <div class="modal-actions">
-      <button class="btn secondary" id="clearKeysBtn">Clear Keys</button>
-      <button class="btn" id="saveKeysBtn">Save &amp; Close</button>
+    <!-- Status Display: Single glassmorphism overlay box at the bottom -->
+    <section class="status-display-card" id="status-card">
+      <div class="transcript-header">
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span>AUDIO TRANSCRIPT FEED</span>
+          <div class="mini-audio-bar">
+            <span class="bar-line"></span>
+            <span class="bar-line"></span>
+            <span class="bar-line"></span>
+            <span class="bar-line"></span>
+            <span class="bar-line"></span>
+          </div>
+        </div>
+        <span id="mode-badge" class="badge-tag">AUTO DIALECT (EN/UR)</span>
+      </div>
+
+      <!-- Live Recognized User Speech -->
+      <div class="transcript-live-container">
+        <span class="transcript-prefix">USER &gt;</span>
+        <span class="transcript-text empty" id="transcript-text">Standing by for voice input...</span>
+      </div>
+
+      <div class="response-divider"></div>
+
+      <!-- Live JARVIS Synthesized Response Text -->
+      <div class="response-container" id="response-container">
+        <span id="response-text">Welcome boss. Systems fully calibrated. Say "Hello Jarvis" or tap the orb to begin speaking.</span>
+      </div>
+
+      <div class="hud-meta-row">
+        <span id="meta-engine-info">ACTIVE ENGINE: GEMINI 2.0 FLASH</span>
+        <span id="meta-coach-mode">COACH: ADAPTIVE MENTOR</span>
+        <span id="meta-tts-info">TTS: READY</span>
+      </div>
+    </section>
+  </div>
+
+  <!-- Settings Modal Overlay for API Keys & Coaching Modes -->
+  <div class="modal-backdrop" id="settings-modal">
+    <div class="settings-panel">
+      <div class="settings-header">
+        <div>
+          <div class="settings-title">SYSTEM CONFIG</div>
+          <div style="font-family: var(--hud-font); font-size: 0.68rem; color: var(--teal-accent);">JARVIS MULTI-API FAILOVER & COACHING</div>
+        </div>
+        <button class="close-btn" id="settings-close-btn">&times;</button>
+      </div>
+
+      <!-- 5-Engine Failover System -->
+      <div>
+        <div class="settings-section-title">⚡ 5-ENGINE AUTO-FAILOVER API KEYS</div>
+        <p style="font-size: 0.75rem; color: var(--text-muted); margin-bottom: 10px;">
+          If an active provider hits rate limits (429) or errors, JARVIS instantly rotates to the next available provider key automatically.
+        </p>
+
+        <!-- 1. Google Gemini -->
+        <div class="key-group">
+          <label class="key-label">
+            <span>1. Google Gemini API Key</span>
+            <span class="key-status-indicator" id="status-gemini">Optional</span>
+          </label>
+          <input type="password" id="key-gemini" class="key-input" placeholder="AIzaSy...">
+        </div>
+
+        <!-- 2. Groq API -->
+        <div class="key-group">
+          <label class="key-label">
+            <span>2. Groq API Key (Llama 3.3 70B)</span>
+            <span class="key-status-indicator" id="status-groq">Optional</span>
+          </label>
+          <input type="password" id="key-groq" class="key-input" placeholder="gsk_...">
+        </div>
+
+        <!-- 3. OpenRouter API -->
+        <div class="key-group">
+          <label class="key-label">
+            <span>3. OpenRouter API Key</span>
+            <span class="key-status-indicator" id="status-openrouter">Optional</span>
+          </label>
+          <input type="password" id="key-openrouter" class="key-input" placeholder="sk-or-v1-...">
+        </div>
+
+        <!-- 4. Together AI API -->
+        <div class="key-group">
+          <label class="key-label">
+            <span>4. Together AI API Key</span>
+            <span class="key-status-indicator" id="status-together">Optional</span>
+          </label>
+          <input type="password" id="key-together" class="key-input" placeholder="together-...">
+        </div>
+
+        <!-- 5. Cohere API -->
+        <div class="key-group">
+          <label class="key-label">
+            <span>5. Cohere API Key</span>
+            <span class="key-status-indicator" id="status-cohere">Optional</span>
+          </label>
+          <input type="password" id="key-cohere" class="key-input" placeholder="cohere-api-key...">
+        </div>
+      </div>
+
+      <!-- Coaching Suite Mode Selector -->
+      <div>
+        <div class="settings-section-title">🎓 ENGLISH LEARNING & COACHING SUITE</div>
+        <select id="coach-mode-select" class="select-input">
+          <option value="adaptive">Adaptive Voice Assistant & Real-Time Corrector (Default)</option>
+          <option value="grammar_drill">Targeted Grammar Drills (Tenses, Modals, Passive Voice)</option>
+          <option value="debate">Group Debate & Public Speaking (Structured Outlines)</option>
+          <option value="interview">Interactive Role-Play: Job Interview</option>
+          <option value="doctor">Interactive Role-Play: Doctor & Patient</option>
+          <option value="classroom">Interactive Role-Play: College Classroom</option>
+        </select>
+      </div>
+
+      <!-- TTS Voice Preference -->
+      <div>
+        <div class="settings-section-title">🔊 VOICE SYNTHESIS SETTINGS</div>
+        <select id="tts-voice-select" class="select-input">
+          <option value="auto">Auto-Detect Best Natural Voice (Urdu / English)</option>
+        </select>
+      </div>
+
+      <!-- GitHub Pages Live Update URL Option -->
+      <div>
+        <div class="settings-section-title">🌐 GITHUB PAGES LIVE-UPDATE URL</div>
+        <p style="font-size: 0.72rem; color: var(--text-muted); margin-bottom: 6px;">
+          Set your hosted GitHub Pages URL if you want your Android APK wrapper to load remote live builds automatically:
+        </p>
+        <input type="url" id="custom-github-url" class="key-input" placeholder="https://yourusername.github.io/jarvis/">
+      </div>
+
+      <!-- Action Buttons -->
+      <div class="btn-row">
+        <button class="primary-btn" id="save-settings-btn">SAVE CONFIGURATION</button>
+        <button class="secondary-btn" id="test-failover-btn">TEST ENGINES</button>
+      </div>
     </div>
   </div>
-</div>
 
-<script src="app.js"></script>
+  <!-- HUD Toast Message -->
+  <div id="hud-toast">CONFIG SAVED</div>
+
+  <!-- Core JARVIS Engine JS -->
+  <script src="app.js"></script>
 </body>
 </html>
